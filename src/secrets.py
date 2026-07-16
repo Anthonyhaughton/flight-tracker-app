@@ -38,6 +38,14 @@ def get_seats_aero_api_key() -> str:
     )
 
 
+def get_discord_webhook_url() -> str:
+    return _require(
+        "DISCORD_WEBHOOK_URL",
+        "Discord webhook URL used to send deal alerts (default v1.0 notifier)",
+        "Server Settings -> Integrations -> Webhooks -> New Webhook -> Copy Webhook URL",
+    )
+
+
 def get_telegram_bot_token() -> str:
     return _require(
         "TELEGRAM_BOT_TOKEN",

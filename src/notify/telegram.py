@@ -44,6 +44,11 @@ class TelegramNotifier:
         if response.status_code != 200:
             raise TelegramError(f"Telegram send failed ({response.status_code}): {response.text}")
 
+    def send_award_alert(
+        self, award: AwardAvailability, verdict: Verdict, trip: dict, *, deep_link: str | None = None
+    ) -> None:
+        self.send(format_award_alert(award, verdict, trip, deep_link=deep_link))
+
     def close(self) -> None:
         self._client.close()
 

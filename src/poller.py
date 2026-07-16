@@ -1,10 +1,13 @@
 """Lambda entrypoint: orchestrates the v1.0 award-only pipeline.
 
 seats.aero cached search -> cabin prefilter -> valuation gate -> dedup ->
-Get Trips detail -> Telegram alert -> record. There is no live-confirm step:
+Get Trips detail -> notifier alert -> record. There is no live-confirm step:
 Live Search is commercial-partner-only and unavailable on a Pro account, so
 Get Trips (called only on candidates that already cleared the valuation
 gate) is the freshness/detail check instead.
+
+Notifier is selected via watchlist.yaml's `notifier` key (discord by
+default; telegram is a swappable alternate impl -- see src/notify/).
 
 Safe to retry: alerts are recorded only after a successful send, and dedup
 means a retried run re-evaluates rather than double-alerting.
@@ -20,7 +23,8 @@ import boto3
 from src import secrets
 from src.config import RouteConfig, WatchlistConfig, load_watchlist
 from src.notify.base import Notifier
-from src.notify.telegram import TelegramNotifier, format_award_alert
+from src.notify.discord import DiscordNotifier
+from src.notify.telegram import TelegramNotifier
 from src.providers.seats_aero import (
     SeatsAeroAuthError,
     SeatsAeroClient,
@@ -40,6 +44,14 @@ HEARTBEAT_METRIC = "PollSucceeded"
 
 class Heartbeat(Protocol):
     def emit(self) -> None: ...
+
+
+def _build_notifier(notifier_name: str) -> Notifier:
+    if notifier_name == "discord":
+        return DiscordNotifier(secrets.get_discord_webhook_url())
+    if notifier_name == "telegram":
+        return TelegramNotifier(secrets.get_telegram_bot_token(), secrets.get_telegram_chat_id())
+    raise ValueError(f"Unknown notifier {notifier_name!r} in watchlist.yaml (expected 'discord' or 'telegram')")
 
 
 class CloudWatchHeartbeat:
@@ -109,7 +121,7 @@ def poll_route(
                 logger.info("%s no longer clears the gate with real taxes, skipping", award.availability_id)
                 continue
 
-            notifier.send(format_award_alert(award, real_verdict, trip))
+            notifier.send_award_alert(award, real_verdict, trip)
             state.record_alert(key, ttl_seconds=config.alerts.dedup_ttl_days * 86400)
             alerts_sent += 1
 
@@ -126,9 +138,10 @@ def run(
 ) -> int:
     config = config or load_watchlist()
     owns_seats_client = seats_client is None
+    owns_notifier = notifier is None
     seats_client = seats_client or SeatsAeroClient(secrets.get_seats_aero_api_key())
     state = state or DynamoStateStore(alerts_table="flight-deal-alerts", baselines_table="flight-deal-baselines")
-    notifier = notifier or TelegramNotifier(secrets.get_telegram_bot_token(), secrets.get_telegram_chat_id())
+    notifier = notifier or _build_notifier(config.notifier)
     heartbeat = heartbeat or CloudWatchHeartbeat()
 
     total_alerts = 0
@@ -141,6 +154,8 @@ def run(
     finally:
         if owns_seats_client:
             seats_client.close()
+        if owns_notifier:
+            notifier.close()
 
     # Only reached on a clean run -- an unhandled exception above (e.g. auth
     # failure) skips this, so a dead/broken poller shows up as a missed

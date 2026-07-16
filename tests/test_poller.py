@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
+import dataclasses
 import datetime
 
 from src.config import AwardConfig, CashConfig, AlertConfig, DateWindow, RouteConfig, ScheduleConfig, WatchlistConfig
-from src.notify.base import Button
 from src.poller import run
 from src.providers.seats_aero import AwardAvailability
 from src.state import InMemoryStateStore, award_key
@@ -42,10 +42,14 @@ class FakeSeatsAeroClient:
 
 class FakeNotifier:
     def __init__(self):
-        self.sent: list[str] = []
+        self.sent: list[tuple] = []  # (award, verdict, trip, deep_link)
+        self.closed = False
 
-    def send(self, message: str, buttons: list[Button] | None = None) -> None:
-        self.sent.append(message)
+    def send_award_alert(self, award, verdict, trip, *, deep_link=None) -> None:
+        self.sent.append((award, verdict, trip, deep_link))
+
+    def close(self) -> None:
+        self.closed = True
 
 
 class FakeHeartbeat:
@@ -139,7 +143,7 @@ def test_poller_sends_alert_for_business_award():
 
     assert alerts_sent == 1
     assert len(notifier.sent) == 1
-    assert "IAD" in notifier.sent[0]
+    assert notifier.sent[0][0].origin == "IAD"
     assert seats_client.get_trips_calls == ["aeroplan-iad-fco-2026-05-14"]
     assert heartbeat.emitted == 1
 
@@ -276,3 +280,86 @@ def test_poller_skips_alert_when_real_taxes_fail_recheck(monkeypatch):
     assert notifier.sent == []
     assert seats_client.get_trips_calls == ["aeroplan-iad-fco-2026-05-14"]  # Get Trips was still called
     assert state.already_alerted(award_key(award)) is False  # never recorded, since nothing was sent
+
+
+class _SpyNotifier:
+    """Stand-in for DiscordNotifier/TelegramNotifier that records its own
+    constructor args instead of touching the network -- used to verify
+    _build_notifier() picks the right class/credentials from config.notifier."""
+
+    def __init__(self, **kwargs):
+        self.init_kwargs = kwargs
+        self.closed = False
+
+    def send_award_alert(self, *args, **kwargs) -> None:
+        pass
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def test_run_defaults_to_discord_notifier_from_config(monkeypatch):
+    """config.notifier defaults to 'discord' -- confirm run() actually picks
+    DiscordNotifier (with the real webhook-url secret) when the caller
+    doesn't inject a notifier, rather than always reaching for Telegram."""
+    import src.poller as poller_module
+
+    monkeypatch.setenv("DISCORD_WEBHOOK_URL", "https://discord.com/api/webhooks/fake/fake-token")
+    spies = []
+    monkeypatch.setattr(
+        poller_module,
+        "DiscordNotifier",
+        lambda webhook_url: spies.append(_SpyNotifier(webhook_url=webhook_url)) or spies[-1],
+    )
+
+    config = make_config()
+    assert config.notifier == "discord"
+
+    run(config, seats_client=FakeSeatsAeroClient([]), state=InMemoryStateStore(), heartbeat=FakeHeartbeat())
+
+    assert len(spies) == 1
+    assert spies[0].init_kwargs == {"webhook_url": "https://discord.com/api/webhooks/fake/fake-token"}
+    assert spies[0].closed is True  # run() owns and closes notifiers it builds itself
+
+
+def test_run_selects_telegram_notifier_when_configured(monkeypatch):
+    """Swapping notifier: telegram in watchlist.yaml must route to
+    TelegramNotifier without any code change -- the whole point of the
+    config knob."""
+    import src.poller as poller_module
+
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "fake-token")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "fake-chat-id")
+    spies = []
+    monkeypatch.setattr(
+        poller_module,
+        "TelegramNotifier",
+        lambda bot_token, chat_id: spies.append(_SpyNotifier(bot_token=bot_token, chat_id=chat_id)) or spies[-1],
+    )
+
+    config = dataclasses.replace(make_config(), notifier="telegram")
+
+    run(config, seats_client=FakeSeatsAeroClient([]), state=InMemoryStateStore(), heartbeat=FakeHeartbeat())
+
+    assert len(spies) == 1
+    assert spies[0].init_kwargs == {"bot_token": "fake-token", "chat_id": "fake-chat-id"}
+
+
+def test_run_rejects_unknown_notifier_name():
+    import pytest
+
+    config = dataclasses.replace(make_config(), notifier="carrier-pigeon")
+
+    with pytest.raises(ValueError, match="carrier-pigeon"):
+        run(config, seats_client=FakeSeatsAeroClient([]), state=InMemoryStateStore(), heartbeat=FakeHeartbeat())
+
+
+def test_run_does_not_close_an_injected_notifier():
+    """An explicitly-passed notifier (as every other test in this file does)
+    is caller-owned -- run() must not close it out from under the caller."""
+    config = make_config()
+    notifier = FakeNotifier()
+
+    run(config, seats_client=FakeSeatsAeroClient([]), state=InMemoryStateStore(), notifier=notifier, heartbeat=FakeHeartbeat())
+
+    assert notifier.closed is False

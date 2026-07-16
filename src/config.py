@@ -73,6 +73,7 @@ class WatchlistConfig:
     cash: CashConfig
     schedule: ScheduleConfig
     alerts: AlertConfig
+    notifier: str = "discord"  # "discord" (default) or "telegram" -- swap without code changes
 
     def active_routes(self) -> list[RouteConfig]:
         return [r for r in self.routes if r.active]
@@ -97,4 +98,5 @@ def load_watchlist(path: str | Path = DEFAULT_WATCHLIST_PATH) -> WatchlistConfig
         cash=CashConfig(**raw["cash"]),
         schedule=ScheduleConfig(**raw["schedule"]),
         alerts=AlertConfig(**raw["alerts"]),
+        notifier=raw.get("notifier", "discord"),
     )

@@ -48,3 +48,6 @@ schedule:
 # --- alerting ---
 alerts:
   dedup_ttl_days: 5                    # a vanished deal can re-alert after this
+
+# --- notifications ---
+notifier: discord    # discord (default) or telegram -- swap without code changes

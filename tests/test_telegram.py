@@ -83,6 +83,20 @@ def test_telegram_send_includes_buttons():
 
 
 @respx.mock
+def test_telegram_send_award_alert_formats_and_sends(saver_business_award):
+    route = respx.post("https://api.telegram.org/bottest-token/sendMessage").mock(
+        return_value=httpx.Response(200, json={"ok": True})
+    )
+    notifier = TelegramNotifier("test-token", "12345")
+    verdict = Verdict(fire=True, reason="saver-equivalent availability", headline="6.5¢/pt vs $5,900 cash")
+
+    notifier.send_award_alert(saver_business_award, verdict, SAMPLE_TRIP)
+
+    assert route.called
+    assert b"IAD" in route.calls[0].request.content
+
+
+@respx.mock
 def test_telegram_send_raises_on_failure():
     respx.post("https://api.telegram.org/bottest-token/sendMessage").mock(
         return_value=httpx.Response(400, text="Bad Request: can't parse entities")
