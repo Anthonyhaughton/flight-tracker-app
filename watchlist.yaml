@@ -1,0 +1,46 @@
+# watchlist.yaml — config-as-code for the deal agent.
+# Editing this file (not code) changes what gets watched and what counts as a deal.
+
+origins: [IAD, DCA, BWI]
+
+routes:
+  - name: "DC → Italy"
+    destinations: [FCO, MXP, VCE]     # Rome, Milan, Venice
+    cabins: [business, first]
+    date_window:
+      # rolling window relative to "today", in days
+      start_offset: 30
+      end_offset: 330
+  - name: "DC → Europe (broad)"
+    destinations: [LHR, CDG, AMS, FRA, ZRH, LIS]
+    cabins: [business]
+    date_window:
+      start_offset: 30
+      end_offset: 300
+
+# --- award valuation ---
+awards:
+  saver_only: true                     # alert on saver awards only; skip dynamic/standard
+  min_trip_value_usd: 1500             # absolute gate: comparable cash must be worth this
+  cpp_floors:                          # cents-per-point required to alert, per program
+    aeroplan:        1.5
+    flying_blue:     1.3
+    aadvantage:      1.5
+    virgin_atlantic: 1.5
+    united:          1.3
+    default:         1.4
+
+# --- cash drop detection ---
+cash:
+  min_drop_pct: 0.20                   # alert if fare drops >=20% below baseline
+  min_drop_abs_usd: 150                # ...or >=$150 below baseline
+  mistake_fare_pct: 0.45               # flag extreme drops as "possible mistake fare"
+
+# --- polling cadence (minutes) ---
+schedule:
+  award_cached_minutes: 20
+  cash_baseline_minutes: 60
+
+# --- alerting ---
+alerts:
+  dedup_ttl_days: 5                    # a vanished deal can re-alert after this
