@@ -5,13 +5,15 @@ origins: [IAD, DCA, BWI]
 
 routes:
   - name: "DC → Italy"
+    active: true                      # v1.0 scope: award-only, this route only
     destinations: [FCO, MXP, VCE]     # Rome, Milan, Venice
-    cabins: [economy, premium_economy]
+    cabins: [business, first]         # saver business-class filter (v1.0)
     date_window:
       # rolling window relative to "today", in days
       start_offset: 30
       end_offset: 330
   - name: "DC → Europe (broad)"
+    active: false                     # v2 scope: "anywhere in Europe" inspiration search
     destinations: [LHR, CDG, AMS, FRA, ZRH, LIS, BCN, CPH]
     cabins: [economy, premium_economy]
     date_window:
@@ -19,8 +21,10 @@ routes:
       end_offset: 300
 
 # --- award valuation ---
+# Saver-vs-dynamic filtering happens at request time (Cached Search's
+# include_filtered param, left omitted -- see seats-aero-integration skill),
+# not a config knob here: there's no per-item saver field to gate on.
 awards:
-  saver_only: true                     # alert on saver awards only; skip dynamic/standard
   min_trip_value_usd: 1500             # absolute gate: comparable cash must be worth this
   cpp_floors:                          # cents-per-point required to alert, per program
     aeroplan:        1.5

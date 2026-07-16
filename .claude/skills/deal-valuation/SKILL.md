@@ -24,8 +24,20 @@ effective_cpp = (comparable_cash_price_usd - award_taxes_fees_usd) / miles_requi
 
 - `comparable_cash_price_usd` comes from `flight-cash-price-monitor` for the same
   route/date/cabin.
-- Alert when **`effective_cpp >= floor_cpp[program]`** AND the award is **saver-priced** AND
-  the cabin is one the owner cares about (long-haul business/first is the sweet spot).
+- `award_taxes_fees_usd` is available from the **Cached Search response itself**
+  (`{X}TotalTaxes`, cents) — no Get Trips call needed for the first-pass gate. See
+  `seats-aero-integration`.
+- Alert when **`effective_cpp >= floor_cpp[program]`** AND the cabin is one the owner cares
+  about (long-haul business/first is the sweet spot). Saver-equivalence is handled at request
+  time, not here (see saver-gate section below).
+
+**Unknown taxes must not be treated as zero.** Some programs (`qatar`, `turkish`,
+`singapore`) don't report taxes and return `0`, indistinguishable from a real $0 co-pay. The
+parser represents this as `taxes_usd = None`. When taxes are `None`, you cannot compute a
+trustworthy effective CPP — **skip with an explicit "can't verify taxes" reason rather than
+substituting 0.0**, which would inflate CPP and fire false alerts for exactly those programs.
+Make the valuation parameter default to `None`, not `0.0`, so a forgetful caller can't
+silently reintroduce the zero-tax bug.
 
 Why effective CPP and not raw miles: 120k miles for a $6,000 business seat (5.0 cpp) is a
 screaming deal; 120k miles for a $900 economy seat (0.75 cpp) is a trap. The cash
@@ -65,9 +77,13 @@ show up here as extreme drops — optionally add a separate lower threshold flag
 
 ## The saver gate
 
-Award pipelines must respect the saver-vs-standard flag from seats.aero. Standard/dynamic
-awards are usually poor value and will erode trust if alerted. Default: **saver only.** Make
-it a config toggle, off by default for standard.
+seats.aero has no per-item saver/standard field to read — dynamic-price filtering is a
+**request-time** choice, controlled by the `include_filtered` query param on Cached Search
+(see `seats-aero-integration`). Leave it false/omitted so every result the poller sees is
+already saver-equivalent; don't build a post-hoc filter looking for a field that isn't
+there. If a later version wants to see raw/dynamic pricing too (e.g. to compare), that's a
+separate, explicit query with `include_filtered=true`, kept out of the default alert path
+so standard/dynamic awards — usually poor value — never silently reach the valuation gate.
 
 ## Dedup & debounce (mandatory)
 

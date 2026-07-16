@@ -1,0 +1,65 @@
+{
+  "data": [
+    {
+      "ID": "aeroplan-iad-fco-2026-05-14",
+      "RouteID": "2HmSwbzAS9SnEdtIsf3nkjozpX1",
+      "Route": {
+        "OriginAirport": "IAD",
+        "OriginRegion": "North America",
+        "DestinationAirport": "FCO",
+        "DestinationRegion": "Europe",
+        "Distance": 4548,
+        "Source": "aeroplan"
+      },
+      "Date": "2026-05-14",
+      "ParsedDate": "2026-05-14T00:00:00Z",
+      "JAvailable": true,
+      "JMileageCost": "88000",
+      "JTotalTaxes": 18000,
+      "JRemainingSeats": 2,
+      "JAirlines": "AC",
+      "JDirect": true,
+      "FAvailable": false,
+      "FMileageCost": "0",
+      "FTotalTaxes": 0,
+      "FRemainingSeats": 0,
+      "FAirlines": "",
+      "FDirect": false,
+      "Source": "aeroplan",
+      "CreatedAt": "2026-04-01T00:00:00Z",
+      "UpdatedAt": "2026-04-15T00:00:00Z",
+      "AvailabilityTrips": null
+    },
+    {
+      "ID": "united-iad-fco-2026-06-01",
+      "RouteID": "8NqTxczBT0ToFeuJtg4olkp0qY2",
+      "Route": {
+        "OriginAirport": "IAD",
+        "OriginRegion": "North America",
+        "DestinationAirport": "FCO",
+        "DestinationRegion": "Europe",
+        "Distance": 4548,
+        "Source": "united"
+      },
+      "Date": "2026-06-01",
+      "ParsedDate": "2026-06-01T00:00:00Z",
+      "JAvailable": true,
+      "JMileageCost": "115000",
+      "JTotalTaxes": 5600,
+      "JRemainingSeats": 1,
+      "JAirlines": "UA, LH",
+      "JDirect": true,
+      "FAvailable": false,
+      "FMileageCost": "0",
+      "FTotalTaxes": 0,
+      "FRemainingSeats": 0,
+      "FAirlines": "",
+      "FDirect": false,
+      "Source": "united",
+      "CreatedAt": "2026-04-02T00:00:00Z",
+      "UpdatedAt": "2026-04-15T00:00:00Z",
+      "AvailabilityTrips": null
+    }
+  ],
+  "hasMore": false
+}

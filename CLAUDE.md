@@ -24,7 +24,7 @@ scrapes airline/OTA sites directly to dodge those terms.
   EventBridge ─▶ │  poller (Lambda)     │
   (schedule)     │                      │
                  │  ┌────────────────┐  │   award space
-                 │  │ seats-aero     │──┼──▶ (cached poll → live confirm)
+                 │  │ seats-aero     │──┼──▶ (cached search → get trips detail)
                  │  └────────────────┘  │
                  │  ┌────────────────┐  │   cash fares
                  │  │ cash provider  │──┼──▶ (SerpApi wrapper, swappable)
@@ -106,9 +106,12 @@ flight-deal-agent/
 - **Dedup is mandatory.** Every alert path goes through the state store. Never send a
   Telegram message without first checking + recording a dedup key. See `deal-valuation`
   for the key design.
-- **Respect rate limits.** seats.aero has a daily quota that resets at 00:00 UTC. Poll the
-  *cached* endpoint frequently and cheaply; spend a *live* search only to confirm a hit
-  right before alerting. Back off on 429s; never hammer.
+- **Respect rate limits.** seats.aero Pro access is a 1,000-calls/day quota that resets at
+  00:00 UTC (not a per-minute limit). Poll *Cached Search* frequently and cheaply; spend a
+  *Get Trips* call only on a candidate that already cleared the valuation gate, right before
+  alerting, for fresher per-trip detail. Live Search is commercial-partner-only and not
+  available on a Pro account — don't design around it. On 429 (quota exhausted), stop for
+  the run; there's no reset until midnight UTC regardless of backoff.
 - **Idempotent pollers.** A poll run must be safe to retry. No partial-send states that
   double-alert on Lambda retry.
 - **Fail loud, not silent.** A poller that dies quietly is worse than useless because
@@ -145,7 +148,7 @@ Do not start v1.1 until v1.0 delivers a real alert to the owner's phone.
 
 | Task | Skill |
 |------|-------|
-| Query award availability, cached-vs-live strategy, rate limits | `seats-aero-integration` |
+| Query award availability, cached-search + get-trips strategy, rate limits | `seats-aero-integration` |
 | Fetch cash fares behind a swappable provider interface | `flight-cash-price-monitor` |
 | Decide if a deal is "high value"; CPP math; dedup key design | `deal-valuation` |
 | Send/format Telegram alerts, MarkdownV2 escaping, buttons | `telegram-alerting` |

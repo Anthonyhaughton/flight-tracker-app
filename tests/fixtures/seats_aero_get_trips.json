@@ -1,0 +1,15 @@
+{
+  "data": [
+    {
+      "ID": "aeroplan-iad-fco-2026-05-14-trip1",
+      "AvailabilityID": "aeroplan-iad-fco-2026-05-14",
+      "MileageCost": 88000,
+      "TotalTaxes": 18000,
+      "Cabin": "business",
+      "RemainingSeats": 2,
+      "FlightNumbers": "AC942",
+      "DepartsAt": "2026-05-14T18:30:00",
+      "ArrivesAt": "2026-05-15T08:45:00"
+    }
+  ]
+}
