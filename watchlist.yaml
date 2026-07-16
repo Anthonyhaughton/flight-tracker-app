@@ -6,14 +6,14 @@ origins: [IAD, DCA, BWI]
 routes:
   - name: "DC → Italy"
     destinations: [FCO, MXP, VCE]     # Rome, Milan, Venice
-    cabins: [business, first]
+    cabins: [economy, premium_economy]
     date_window:
       # rolling window relative to "today", in days
       start_offset: 30
       end_offset: 330
   - name: "DC → Europe (broad)"
-    destinations: [LHR, CDG, AMS, FRA, ZRH, LIS]
-    cabins: [business]
+    destinations: [LHR, CDG, AMS, FRA, ZRH, LIS, BCN, CPH]
+    cabins: [economy, premium_economy]
     date_window:
       start_offset: 30
       end_offset: 300
