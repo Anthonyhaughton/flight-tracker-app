@@ -1,0 +1,115 @@
+---
+name: deal-valuation
+description: Decide whether a flight deal (award or cash) is genuinely "high value" and worth an alert, and design the deduplication that prevents alert spam. Use this whenever the task involves cents-per-point (CPP) math, valuing a points/miles redemption, comparing award cost against cash, setting alert thresholds, deciding "is this a good deal", or building the dedup/debounce logic for notifications. This is the brain of the pipeline — reach for it whenever the question is "should we alert on this?" rather than "how do we fetch this?".
+---
+
+# Deal valuation & dedup
+
+This skill owns the single decision the whole project exists to make: **is this deal good
+enough to interrupt the owner's day, and have we already told them?** Fetching data is easy;
+this judgment is where the project succeeds or fails. If it's too loose the owner mutes the
+bot; too tight and they miss deals.
+
+## The valuation model
+
+Two triggers, either can fire an alert.
+
+### 1. Award redemption value (effective cents-per-point)
+
+For an award seat, compute how much value each mile extracts versus paying cash:
+
+```
+effective_cpp = (comparable_cash_price_usd - award_taxes_fees_usd) / miles_required * 100
+```
+
+- `comparable_cash_price_usd` comes from `flight-cash-price-monitor` for the same
+  route/date/cabin.
+- Alert when **`effective_cpp >= floor_cpp[program]`** AND the award is **saver-priced** AND
+  the cabin is one the owner cares about (long-haul business/first is the sweet spot).
+
+Why effective CPP and not raw miles: 120k miles for a $6,000 business seat (5.0 cpp) is a
+screaming deal; 120k miles for a $900 economy seat (0.75 cpp) is a trap. The cash
+comparison is what separates them.
+
+Per-program floors live in `watchlist.yaml` because "good" differs by currency. Sensible
+starting floors (the owner should tune these):
+
+```yaml
+cpp_floors:          # cents per point to be worth alerting
+  aeroplan:        1.5
+  flying_blue:     1.3
+  aadvantage:      1.5
+  virgin_atlantic: 1.5
+  united:          1.3
+  default:         1.4
+```
+
+Also apply an **absolute-value gate** so we don't alert on a technically-great CPP that
+saves $40. Example: only alert if `(comparable_cash_price - award_taxes) >= min_trip_value`
+(e.g., $1,500 for the long-haul premium cabins we actually care about).
+
+### 2. Cash price drop
+
+For a revenue fare, alert when the current low drops below its tracked baseline by more than
+the configured margin:
+
+```
+drop_pct = (baseline_price - current_price) / baseline_price
+alert if drop_pct >= min_drop_pct   # e.g., 0.20
+   or  (baseline_price - current_price) >= min_drop_abs
+```
+
+Never alert before a baseline exists (seed the first observation silently). Mistake fares
+show up here as extreme drops — optionally add a separate lower threshold flagged as
+"possible mistake fare, book fast."
+
+## The saver gate
+
+Award pipelines must respect the saver-vs-standard flag from seats.aero. Standard/dynamic
+awards are usually poor value and will erode trust if alerted. Default: **saver only.** Make
+it a config toggle, off by default for standard.
+
+## Dedup & debounce (mandatory)
+
+Every alert passes through the state store before sending. The point is to alert on *new*
+deals and *meaningful changes*, not the same seat every 20 minutes.
+
+**Dedup key design** — bucket the price so tiny fluctuations don't re-fire:
+
+```python
+def award_key(a: AwardAvailability) -> str:
+    miles_bucket = a.miles // 5000 * 5000          # 5k-mile buckets
+    return f"award:{a.origin}-{a.destination}:{a.date}:{a.cabin}:{a.program}:{miles_bucket}"
+
+def cash_key(f: CashFare) -> str:
+    price_bucket = int(f.price_usd // 50 * 50)      # $50 buckets
+    return f"cash:{f.origin}-{f.destination}:{f.date}:{f.cabin}:{price_bucket}"
+```
+
+**State store contract:**
+
+```python
+class StateStore(Protocol):
+    def already_alerted(self, key: str) -> bool: ...
+    def record_alert(self, key: str, ttl_seconds: int) -> None: ...
+    # baselines for cash drop detection:
+    def get_baseline(self, route_key: str) -> Baseline | None: ...
+    def update_baseline(self, route_key: str, price: float) -> None: ...
+```
+
+- Give alert records a **TTL** (e.g., 3–7 days) so a deal that vanishes and genuinely
+  returns later can re-alert, but the same standing deal doesn't nag daily. DynamoDB TTL is
+  perfect for this.
+- Record the alert **only after** a successful send, but guard against double-send on Lambda
+  retry (idempotent: check-then-set, or write a "pending" marker). Prefer: send, then record;
+  and make the whole poll idempotent so a retry re-evaluates cleanly rather than
+  double-firing.
+- A *materially better* version of an existing deal (e.g., price crosses into a lower
+  bucket) is allowed to re-alert — that's why the bucket is in the key.
+
+## Output of this layer
+
+`is_high_value(candidate) -> Verdict` where `Verdict` carries: fire/skip, the reason
+(effective CPP or drop %), and a human-readable one-liner the notifier can drop straight
+into the message ("Business saver, 4.8¢/pt vs $5,900 cash"). Keep the *why* attached to the
+verdict so the alert explains itself.
