@@ -145,10 +145,19 @@ def _validate_and_clean_embeds(embeds: list[dict]) -> list[dict]:
 
 
 def format_award_embed(award: AwardAvailability, verdict: Verdict, trip: dict, *, deep_link: str | None = None) -> dict:
-    """`trip` is one entry from SeatsAeroClient.get_trips(award.availability_id)
-    -- called right before alerting, so it has the freshest MileageCost/
-    TotalTaxes/Cabin/RemainingSeats."""
-    cabin_label = str(trip.get("Cabin", award.cabin)).title()
+    """`trip` is one entry from SeatsAeroClient.get_trips(award.availability_id),
+    already filtered to award.cabin by select_trip_for_cabin() in poller.py
+    (Get Trips returns itineraries across ALL cabins on the availability, so
+    trip["Cabin"] can't be trusted blindly -- see select_trip_for_cabin's
+    docstring). The title uses award.cabin directly, not trip's own Cabin
+    field, since award.cabin is what Cached Search and the valuation gate
+    actually matched on.
+
+    No "saver" in the title: there's no per-item saver flag on the wire --
+    saver-equivalence comes entirely from the Cached Search request-time
+    filter (see seats_aero.py's cached_search docstring), so claiming it
+    per-item here would be asserting something we can't verify."""
+    cabin_label = award.cabin.title()
     program_label = award.program.replace("_", " ").title()
     miles = int(trip["MileageCost"])
     taxes_usd = parse_trip_taxes_usd(trip)
@@ -165,7 +174,7 @@ def format_award_embed(award: AwardAvailability, verdict: Verdict, trip: dict, *
     fields = [f for f in fields if f["value"]]  # Discord 400s on empty field values
 
     embed: dict = {
-        "title": f"{cabin_label} saver - {award.origin} -> {award.destination}",
+        "title": f"{cabin_label} - {award.origin} -> {award.destination}",
         "color": COLOR_GOOD_DEAL,
         "fields": fields,
         "footer": {"text": verdict.headline or "Award deal alert"},

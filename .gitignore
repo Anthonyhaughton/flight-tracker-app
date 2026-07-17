@@ -24,3 +24,6 @@ build/
 
 # Packaging
 *.zip
+
+# Local dry-run state (scripts/dry_run.py) -- not the production StateStore
+scripts/.dry_run_state.json

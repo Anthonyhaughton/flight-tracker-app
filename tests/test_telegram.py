@@ -43,13 +43,25 @@ def test_format_award_alert_escapes_dynamic_values(saver_business_award):
 
 
 def test_format_award_alert_uses_trip_detail_for_miles_and_taxes(saver_business_award):
-    # trip has fresher numbers than the Cached Search hit; message should
-    # reflect the trip's MileageCost/TotalTaxes/Cabin, not the award's.
+    # trip has fresher miles/taxes than the Cached Search hit; message
+    # should reflect those. Cabin is a separate story -- see the next test.
     verdict = Verdict(fire=True, reason="saver-equivalent availability", headline="6.5¢/pt vs $5,900 cash")
-    trip = {**SAMPLE_TRIP, "MileageCost": 90000, "TotalTaxes": 20000, "Cabin": "first"}
+    trip = {**SAMPLE_TRIP, "MileageCost": 90000, "TotalTaxes": 20000}
     message = format_award_alert(saver_business_award, verdict, trip)
     assert "90,000" in message
-    assert "First" in message
+
+
+def test_format_award_alert_uses_award_cabin_not_trip_cabin(saver_business_award):
+    """Regression (found in the first live dry run): Get Trips returns
+    itineraries across ALL cabins for an AvailabilityID, not just the one
+    Cached Search matched -- trusting trip["Cabin"] showed the wrong cabin.
+    The message must reflect award.cabin ("business" here), even when
+    handed a mismatched trip."""
+    verdict = Verdict(fire=True, reason="saver-equivalent availability", headline="6.5¢/pt vs $5,900 cash")
+    mismatched_trip = {**SAMPLE_TRIP, "Cabin": "first"}
+    message = format_award_alert(saver_business_award, verdict, mismatched_trip)
+    assert "Business" in message
+    assert "First" not in message
 
 
 def test_format_award_alert_includes_deep_link(saver_business_award):

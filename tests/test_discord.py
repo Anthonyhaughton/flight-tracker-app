@@ -34,7 +34,7 @@ SAMPLE_VERDICT = Verdict(fire=True, reason="saver-equivalent availability", head
 def test_format_award_embed_structure(saver_business_award):
     embed = format_award_embed(saver_business_award, SAMPLE_VERDICT, SAMPLE_TRIP)
 
-    assert embed["title"] == "Business saver - IAD -> FCO"
+    assert embed["title"] == "Business - IAD -> FCO"
     assert embed["color"] == COLOR_GOOD_DEAL
     assert isinstance(embed["color"], int)
 
@@ -57,6 +57,18 @@ def test_format_award_embed_includes_url_when_deep_link_given(saver_business_awa
     assert embed["url"] == "https://example.com/book"
 
 
+def test_format_award_embed_title_uses_award_cabin_not_trip_cabin(saver_business_award):
+    """Regression (found in the first live dry run): Get Trips returns
+    itineraries across ALL cabins for an AvailabilityID, not just the one
+    Cached Search matched -- a business-cabin award's title showed "Economy"
+    because trip["Cabin"] was blindly trusted. The title must reflect
+    award.cabin ("business" here), even when handed a mismatched trip."""
+    mismatched_trip = {**SAMPLE_TRIP, "Cabin": "economy"}
+    embed = format_award_embed(saver_business_award, SAMPLE_VERDICT, mismatched_trip)
+    assert embed["title"] == "Business - IAD -> FCO"
+    assert "Economy" not in embed["title"]
+
+
 def test_format_award_embed_marks_connecting_flights(saver_business_award):
     import dataclasses
 
@@ -77,7 +89,7 @@ def test_format_award_embed_no_markdown_escaping_needed(saver_business_award):
     # Discord embeds render plain text -- a literal '.' or '-' must NOT be
     # backslash-escaped the way Telegram's MarkdownV2 requires.
     embed = format_award_embed(saver_business_award, SAMPLE_VERDICT, SAMPLE_TRIP)
-    assert embed["title"] == "Business saver - IAD -> FCO"  # no "\\-"
+    assert embed["title"] == "Business - IAD -> FCO"  # no "\\-"
     fields_by_name = {f["name"]: f["value"] for f in embed["fields"]}
     assert fields_by_name["Date"] == "2026-05-14"  # no "\\-"
     assert fields_by_name["Taxes (USD)"] == "$180.00"  # no "\\."
@@ -100,7 +112,7 @@ def test_send_award_alert_success_on_204(saver_business_award):
     payload = json.loads(body)
     assert isinstance(payload["embeds"], list)
     assert len(payload["embeds"]) == 1
-    assert payload["embeds"][0]["title"] == "Business saver - IAD -> FCO"
+    assert payload["embeds"][0]["title"] == "Business - IAD -> FCO"
 
 
 @respx.mock

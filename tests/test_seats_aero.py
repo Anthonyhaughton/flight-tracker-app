@@ -11,6 +11,7 @@ from src.providers.seats_aero import (
     SeatsAeroClient,
     SeatsAeroRateLimitError,
     parse_trip_taxes_usd,
+    select_trip_for_cabin,
 )
 from tests.conftest import load_fixture
 
@@ -221,3 +222,36 @@ def test_client_has_no_live_search_method():
     # Live Search is commercial-partner-only and unavailable on a Pro
     # account -- confirm we didn't reintroduce it.
     assert not hasattr(SeatsAeroClient, "live_search")
+
+
+def test_select_trip_for_cabin_skips_non_matching_cabins():
+    """Regression: confirmed via a real live call that Get Trips returns
+    itineraries across ALL cabins for one AvailabilityID (88 trips for a
+    single business-cabin hit, spanning economy/premium/business/first),
+    not just the cabin Cached Search matched. trips[0] is not reliable."""
+    trips = [
+        {"Cabin": "economy", "MileageCost": 40000},
+        {"Cabin": "business", "MileageCost": 88000},
+        {"Cabin": "first", "MileageCost": 150000},
+    ]
+    selected = select_trip_for_cabin(trips, "business")
+    assert selected["MileageCost"] == 88000
+
+
+def test_select_trip_for_cabin_picks_cheapest_among_matches():
+    trips = [
+        {"Cabin": "business", "MileageCost": 95000},
+        {"Cabin": "business", "MileageCost": 88000},
+        {"Cabin": "economy", "MileageCost": 1},  # decoy: cheapest overall, wrong cabin
+    ]
+    selected = select_trip_for_cabin(trips, "business")
+    assert selected["MileageCost"] == 88000
+
+
+def test_select_trip_for_cabin_returns_none_when_no_match():
+    trips = [{"Cabin": "economy", "MileageCost": 40000}]
+    assert select_trip_for_cabin(trips, "business") is None
+
+
+def test_select_trip_for_cabin_handles_empty_list():
+    assert select_trip_for_cabin([], "business") is None

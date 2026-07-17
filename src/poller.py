@@ -30,6 +30,7 @@ from src.providers.seats_aero import (
     SeatsAeroClient,
     SeatsAeroRateLimitError,
     parse_trip_taxes_usd,
+    select_trip_for_cabin,
 )
 from src.state import DynamoStateStore, StateStore, award_key
 from src.valuation import is_high_value
@@ -104,7 +105,17 @@ def poll_route(
             if not trips:
                 logger.info("no trip detail for %s, skipping (space likely gone)", award.availability_id)
                 continue
-            trip = trips[0]
+
+            # Get Trips returns itineraries across ALL cabins on this
+            # availability, not just the one we matched -- trips[0] is not
+            # guaranteed to be (and in practice often isn't) award.cabin.
+            trip = select_trip_for_cabin(trips, award.cabin)
+            if trip is None:
+                logger.info(
+                    "no %s-cabin trip among %d Get Trips result(s) for %s, skipping",
+                    award.cabin, len(trips), award.availability_id,
+                )
+                continue
 
             # Re-run the gate with Get Trips' taxes. Cached Search already gave
             # us real taxes above (when the program reports them), so this

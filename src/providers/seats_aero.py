@@ -81,6 +81,23 @@ def parse_trip_taxes_usd(trip: dict) -> float:
     return _cents_to_usd(trip.get("TotalTaxes", 0))
 
 
+def select_trip_for_cabin(trips: list[dict], cabin: str) -> dict | None:
+    """Get Trips returns every itinerary for the AvailabilityID across ALL
+    cabins on that route+date+program -- confirmed against a real call: one
+    business-cabin Cached Search hit's Get Trips response held 88 trips
+    spanning economy/premium/business/first, not just the cabin that
+    matched. `trips[0]` is NOT guaranteed to be -- and in that real case
+    wasn't -- the cabin we're alerting on.
+
+    Picks the cheapest trip whose `Cabin` matches, or None if none does
+    (the poller treats that like "no trip detail" -- skip rather than alert
+    with the wrong cabin's miles/taxes)."""
+    matching = [t for t in trips if t.get("Cabin") == cabin]
+    if not matching:
+        return None
+    return min(matching, key=lambda t: t.get("MileageCost", float("inf")))
+
+
 class SeatsAeroClient:
     def __init__(
         self,

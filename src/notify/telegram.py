@@ -63,18 +63,25 @@ def _button_to_dict(button: Button) -> dict:
 
 
 def format_award_alert(award: AwardAvailability, verdict: Verdict, trip: dict, *, deep_link: str | None = None) -> str:
-    """`trip` is one entry from SeatsAeroClient.get_trips(award.availability_id)
-    -- called right before alerting, so it has the freshest, typed
-    MileageCost/TotalTaxes/Cabin (Cached Search itself has no taxes field)."""
+    """`trip` is one entry from SeatsAeroClient.get_trips(award.availability_id),
+    already filtered to award.cabin by select_trip_for_cabin() in poller.py
+    (Get Trips returns itineraries across ALL cabins on the availability, so
+    trip["Cabin"] can't be trusted blindly). The cabin label uses award.cabin
+    directly, not trip's own Cabin field.
+
+    No "saver" in the message: there's no per-item saver flag on the wire --
+    saver-equivalence comes entirely from the Cached Search request-time
+    filter, so claiming it per-item here would assert something we can't
+    verify."""
     esc = escape_markdown_v2
     stops = "nonstop" if award.direct else "connecting"
     program_label = award.program.replace("_", " ").title()
-    cabin_label = str(trip.get("Cabin", award.cabin)).title()
+    cabin_label = award.cabin.title()
     miles = int(trip["MileageCost"])
     taxes_usd = parse_trip_taxes_usd(trip)
 
     lines = [
-        f"\U0001F3AF *{esc(cabin_label)} saver* {esc(award.origin)} → {esc(award.destination)}",
+        f"\U0001F3AF *{esc(cabin_label)}* {esc(award.origin)} → {esc(award.destination)}",
         f"\U0001F4C5 {esc(award.date.isoformat())} \\({esc(stops)}\\)",
         f"\U0001F4B3 {esc(f'{miles:,}')} {esc(program_label)} \\+ \\${esc(f'{taxes_usd:,.0f}')}"
         f"  →  {esc(verdict.headline)}",

@@ -23,7 +23,21 @@ class FakeSeatsAeroClient:
         self.get_trips_calls.append(availability_id)
         for hit in self._hits:
             if hit.availability_id == availability_id:
+                # Mirrors the real API: Get Trips returns itineraries across
+                # ALL cabins for the availability, with a decoy (wrong-cabin,
+                # deliberately cheaper, listed FIRST) trip -- so any test
+                # using this fake would catch a regression back to trips[0].
+                decoy_cabin = "economy" if hit.cabin != "economy" else "premium_economy"
                 return [
+                    {
+                        "ID": f"{availability_id}-decoy",
+                        "AvailabilityID": availability_id,
+                        "MileageCost": 1,
+                        "TotalTaxes": 100,
+                        "Cabin": decoy_cabin,
+                        "RemainingSeats": 9,
+                        "FlightNumbers": "XX000",
+                    },
                     {
                         "ID": f"{availability_id}-trip1",
                         "AvailabilityID": availability_id,
@@ -32,7 +46,7 @@ class FakeSeatsAeroClient:
                         "Cabin": hit.cabin,
                         "RemainingSeats": hit.seats,
                         "FlightNumbers": "AC942",
-                    }
+                    },
                 ]
         return None
 
@@ -146,6 +160,25 @@ def test_poller_sends_alert_for_business_award():
     assert notifier.sent[0][0].origin == "IAD"
     assert seats_client.get_trips_calls == ["aeroplan-iad-fco-2026-05-14"]
     assert heartbeat.emitted == 1
+
+
+def test_poller_selects_matching_cabin_trip_not_first_trip():
+    """Regression (found in the first live dry run): FakeSeatsAeroClient's
+    get_trips() returns a decoy wrong-cabin trip first (mirroring the real
+    API), so a naive trips[0] would hand the notifier the decoy's 1 mile /
+    economy cabin instead of the real business award."""
+    config = make_config()
+    award = make_award()
+    seats_client = FakeSeatsAeroClient([award])
+    state = InMemoryStateStore()
+    notifier = FakeNotifier()
+    heartbeat = FakeHeartbeat()
+
+    run(config, seats_client=seats_client, state=state, notifier=notifier, heartbeat=heartbeat)
+
+    sent_trip = notifier.sent[0][2]
+    assert sent_trip["Cabin"] == "business"
+    assert sent_trip["MileageCost"] == award.miles
 
 
 def test_poller_skips_untracked_cabin():
