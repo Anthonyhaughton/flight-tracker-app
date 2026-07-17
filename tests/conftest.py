@@ -16,6 +16,14 @@ def load_fixture(name: str) -> dict:
     return json.loads((FIXTURES_DIR / name).read_text())
 
 
+@pytest.fixture(autouse=True)
+def _not_in_lambda(monkeypatch):
+    """secrets.py branches on AWS_LAMBDA_FUNCTION_NAME to decide env-var vs.
+    SSM resolution -- ensure it's unset by default so tests exercise the
+    local/dev path unless a test explicitly opts into the Lambda path."""
+    monkeypatch.delenv("AWS_LAMBDA_FUNCTION_NAME", raising=False)
+
+
 @pytest.fixture
 def award_config() -> AwardConfig:
     return AwardConfig(

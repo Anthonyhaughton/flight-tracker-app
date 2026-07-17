@@ -2,6 +2,14 @@
 # ARNs, nothing on "*" except where the AWS API genuinely has no
 # resource-level permission support (noted inline).
 
+# SSM SecureString parameters (infra/secrets.tf) use the AWS-managed default
+# key (alias/aws/ssm) since no key_id was specified on those resources --
+# this looks up its real ARN so the Decrypt grant below can be scoped to it
+# specifically, rather than every KMS key in the account.
+data "aws_kms_alias" "ssm_default" {
+  name = "alias/aws/ssm"
+}
+
 data "aws_iam_policy_document" "lambda_assume_role" {
   statement {
     actions = ["sts:AssumeRole"]
@@ -43,9 +51,17 @@ data "aws_iam_policy_document" "lambda_permissions" {
     actions = ["ssm:GetParameter", "ssm:GetParameters"]
     resources = [
       aws_ssm_parameter.seats_aero_api_key.arn,
+      aws_ssm_parameter.discord_webhook_url.arn,
       aws_ssm_parameter.telegram_bot_token.arn,
       aws_ssm_parameter.telegram_chat_id.arn,
+      aws_ssm_parameter.serpapi_key.arn,
     ]
+  }
+
+  statement {
+    sid       = "SsmDecrypt"
+    actions   = ["kms:Decrypt"]
+    resources = [data.aws_kms_alias.ssm_default.target_key_arn]
   }
 
   statement {

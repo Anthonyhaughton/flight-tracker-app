@@ -1,0 +1,46 @@
+# Fixture watchlist for tests/test_config.py only. Deliberately decoupled
+# from the real watchlist.yaml at the repo root, which gets tuned for live
+# testing (routes/origins narrowed, widened, etc.) -- these values must stay
+# stable since test_config.py's assertions are hardcoded against them.
+
+origins: [IAD, DCA, BWI]
+
+routes:
+  - name: "DC → Italy"
+    active: true
+    destinations: [FCO, MXP, VCE]
+    cabins: [business, first]
+    date_window:
+      start_offset: 30
+      end_offset: 330
+  - name: "DC → Europe (broad)"
+    active: false
+    destinations: [LHR, CDG, AMS, FRA, ZRH, LIS, BCN, CPH]
+    cabins: [economy, premium_economy]
+    date_window:
+      start_offset: 30
+      end_offset: 300
+
+awards:
+  min_trip_value_usd: 1500
+  cpp_floors:
+    aeroplan: 1.5
+    flying_blue: 1.3
+    aadvantage: 1.5
+    virgin_atlantic: 1.5
+    united: 1.3
+    default: 1.4
+
+cash:
+  min_drop_pct: 0.20
+  min_drop_abs_usd: 150
+  mistake_fare_pct: 0.45
+
+schedule:
+  award_cached_minutes: 20
+  cash_baseline_minutes: 60
+
+alerts:
+  dedup_ttl_days: 5
+
+notifier: discord

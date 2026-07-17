@@ -34,6 +34,7 @@ resource "aws_scheduler_schedule" "award_cached_poll" {
   name                         = "${var.project_name}-award-cached-poll"
   schedule_expression          = var.award_poll_schedule_expression
   schedule_expression_timezone = "UTC"
+  state                        = var.schedule_enabled ? "ENABLED" : "DISABLED"
 
   flexible_time_window {
     mode = "OFF"

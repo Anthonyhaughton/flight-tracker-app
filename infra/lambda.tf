@@ -3,21 +3,6 @@
 # option. Switch to a container image only if a later phase needs
 # Playwright/Chromium (see .claude/skills/flight-cash-price-monitor).
 
-data "aws_ssm_parameter" "seats_aero_api_key" {
-  name            = aws_ssm_parameter.seats_aero_api_key.name
-  with_decryption = true
-}
-
-data "aws_ssm_parameter" "telegram_bot_token" {
-  name            = aws_ssm_parameter.telegram_bot_token.name
-  with_decryption = true
-}
-
-data "aws_ssm_parameter" "telegram_chat_id" {
-  name            = aws_ssm_parameter.telegram_chat_id.name
-  with_decryption = true
-}
-
 resource "aws_cloudwatch_log_group" "poller" {
   name              = "/aws/lambda/${var.project_name}-poller"
   retention_in_days = 30
@@ -25,7 +10,7 @@ resource "aws_cloudwatch_log_group" "poller" {
 
 resource "aws_lambda_function" "poller" {
   function_name = "${var.project_name}-poller"
-  description   = "Polls seats.aero for award availability and alerts via Telegram on high-value deals."
+  description   = "Polls seats.aero for award availability and alerts via Discord (default) or Telegram on high-value deals."
 
   filename         = var.lambda_zip_path
   source_code_hash = filebase64sha256(var.lambda_zip_path)
@@ -39,13 +24,21 @@ resource "aws_lambda_function" "poller" {
 
   role = aws_iam_role.lambda_exec.arn
 
+  # No secret values here -- only SSM Parameter Store *names* (not
+  # sensitive). src/secrets.py resolves the real values via boto3 at cold
+  # start (detected via the AWS_LAMBDA_FUNCTION_NAME env var Lambda sets
+  # automatically), so decrypted secrets never land in Terraform state or
+  # the Lambda console's environment-variables view. See infra/secrets.tf
+  # and iam.tf.
   environment {
     variables = {
-      SEATS_AERO_API_KEY   = data.aws_ssm_parameter.seats_aero_api_key.value
-      TELEGRAM_BOT_TOKEN   = data.aws_ssm_parameter.telegram_bot_token.value
-      TELEGRAM_CHAT_ID     = data.aws_ssm_parameter.telegram_chat_id.value
-      ALERTS_TABLE_NAME    = aws_dynamodb_table.alerts.name
-      BASELINES_TABLE_NAME = aws_dynamodb_table.baselines.name
+      SEATS_AERO_API_KEY_SSM_PARAM  = aws_ssm_parameter.seats_aero_api_key.name
+      DISCORD_WEBHOOK_URL_SSM_PARAM = aws_ssm_parameter.discord_webhook_url.name
+      TELEGRAM_BOT_TOKEN_SSM_PARAM  = aws_ssm_parameter.telegram_bot_token.name
+      TELEGRAM_CHAT_ID_SSM_PARAM    = aws_ssm_parameter.telegram_chat_id.name
+      SERPAPI_KEY_SSM_PARAM         = aws_ssm_parameter.serpapi_key.name
+      ALERTS_TABLE_NAME             = aws_dynamodb_table.alerts.name
+      BASELINES_TABLE_NAME          = aws_dynamodb_table.baselines.name
     }
   }
 

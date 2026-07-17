@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import datetime
+import logging
 
 from src.config import AwardConfig, CashConfig, AlertConfig, DateWindow, RouteConfig, ScheduleConfig, WatchlistConfig
 from src.poller import run
@@ -241,6 +242,93 @@ def test_poller_re_alerts_when_price_crosses_lower_bucket():
     assert len(notifier.sent) == 2
 
 
+def make_distinct_awards(n: int) -> list[AwardAvailability]:
+    """n distinct qualifying awards -- different dates/availability_ids AND
+    different miles buckets, so each gets its own dedup key (award_key
+    buckets by miles // 5000 * 5000) and none collide with each other."""
+    return [
+        make_award(
+            availability_id=f"aeroplan-iad-fco-2026-05-{14 + i}",
+            date=datetime.date(2026, 5, 14 + i),
+            miles=88000 + i * 10000,
+        )
+        for i in range(n)
+    ]
+
+
+def test_run_enforces_max_alerts_per_run_cap():
+    """Regression: a real production run alerted 73 times in one invoke
+    because there was no per-run cap -- a wide date window + an empty dedup
+    table let every qualifying candidate through. 5 distinct new qualifying
+    awards (never seen before, so dedup can't be what's limiting them),
+    cap=3 -- only 3 may send even though all 5 clear the valuation gate."""
+    config = dataclasses.replace(make_config(), alerts=AlertConfig(dedup_ttl_days=5, max_alerts_per_run=3))
+    awards = make_distinct_awards(5)
+    seats_client = FakeSeatsAeroClient(awards)
+    state = InMemoryStateStore()
+    notifier = FakeNotifier()
+    heartbeat = FakeHeartbeat()
+
+    alerts_sent = run(config, seats_client=seats_client, state=state, notifier=notifier, heartbeat=heartbeat)
+
+    assert alerts_sent == 3
+    assert len(notifier.sent) == 3
+
+
+def test_poll_route_counts_duplicate_and_capped_skips_separately():
+    """Dedup and the cap are independent gates (dedup = same deal on a LATER
+    run; cap = too many NEW deals in ONE run) -- confirm PollStats keeps them
+    in separate counters rather than lumping both into one 'skipped' bucket.
+    First pass: 5 new awards, cap=3 -> 3 sent, 2 capped, 0 duplicate. Second
+    pass with fresh stats but the SAME state: the 3 already-sent awards are
+    now duplicates (not capped -- the cap counter resets per run and never
+    even got exercised by them), and the other 2 still have cap budget."""
+    from src.poller import poll_route
+
+    config = make_config()
+    route = config.routes[0]
+    awards = make_distinct_awards(5)
+    state = InMemoryStateStore()
+    notifier = FakeNotifier()
+
+    stats = poll_route(
+        FakeSeatsAeroClient(awards), config.origins, route, config, state, notifier, max_alerts_per_run=3
+    )
+    assert stats.alerts_sent == 3
+    assert stats.skipped_capped == 2
+    assert stats.skipped_duplicate == 0
+
+    stats2 = poll_route(
+        FakeSeatsAeroClient(awards), config.origins, route, config, state, notifier, max_alerts_per_run=3
+    )
+    assert stats2.skipped_duplicate == 3
+    assert stats2.alerts_sent == 2
+    assert stats2.skipped_capped == 0
+
+
+def test_run_logs_cap_and_duplicate_counts_separately(caplog):
+    """The end-of-run summary log line must make the cap legible as a
+    distinct number from duplicates and from total evaluated/sent, so a
+    future run's logs make it obvious whether the cap was the limiting
+    factor (this is precisely what was invisible during the 73-alert
+    flood)."""
+    config = dataclasses.replace(make_config(), alerts=AlertConfig(dedup_ttl_days=5, max_alerts_per_run=1))
+    awards = make_distinct_awards(3)
+    seats_client = FakeSeatsAeroClient(awards)
+    state = InMemoryStateStore()
+    notifier = FakeNotifier()
+    heartbeat = FakeHeartbeat()
+
+    with caplog.at_level(logging.INFO, logger="poller"):
+        run(config, seats_client=seats_client, state=state, notifier=notifier, heartbeat=heartbeat)
+
+    summary = next(r.getMessage() for r in caplog.records if "poll complete" in r.getMessage())
+    assert "3 candidate(s) evaluated" in summary
+    assert "1 alert(s) sent" in summary
+    assert "0 skipped as duplicate" in summary
+    assert "2 skipped (cap reached)" in summary
+
+
 def test_poller_skips_when_get_trips_shows_space_gone():
     config = make_config()
     award = make_award()
@@ -385,6 +473,75 @@ def test_run_rejects_unknown_notifier_name():
 
     with pytest.raises(ValueError, match="carrier-pigeon"):
         run(config, seats_client=FakeSeatsAeroClient([]), state=InMemoryStateStore(), heartbeat=FakeHeartbeat())
+
+
+class _SpyState:
+    """Stand-in for DynamoStateStore that records its own constructor args
+    instead of touching real DynamoDB -- used to verify run() sources table
+    names from the environment, not a hardcoded default."""
+
+    def __init__(self, alerts_table, baselines_table):
+        self.alerts_table = alerts_table
+        self.baselines_table = baselines_table
+
+    def already_alerted(self, key: str) -> bool:
+        return False
+
+    def record_alert(self, key: str, ttl_seconds: int) -> None:
+        pass
+
+    def get_baseline(self, route_key: str):
+        return None
+
+    def update_baseline(self, route_key: str, price: float) -> None:
+        pass
+
+
+def test_run_builds_dynamo_state_store_from_env_vars_not_hardcoded_names(monkeypatch):
+    """Regression: run() used to hardcode DynamoStateStore(alerts_table=
+    "flight-deal-alerts", baselines_table="flight-deal-baselines") -- stale
+    names from before the project was renamed to flight-tracker-app. In
+    production this 403'd (AccessDeniedException on dynamodb:GetItem)
+    instead of 404ing, because IAM (infra/iam.tf) only grants access to the
+    real Terraform-created tables (infra/dynamodb.tf), and nothing had ever
+    granted access to a table nobody asked for. infra/lambda.tf already sets
+    ALERTS_TABLE_NAME/BASELINES_TABLE_NAME from the real
+    aws_dynamodb_table.*.name references -- run() must actually read them."""
+    import src.poller as poller_module
+
+    monkeypatch.setenv("ALERTS_TABLE_NAME", "flight-tracker-app-alerts")
+    monkeypatch.setenv("BASELINES_TABLE_NAME", "flight-tracker-app-baselines")
+
+    spies = []
+    monkeypatch.setattr(
+        poller_module,
+        "DynamoStateStore",
+        lambda alerts_table, baselines_table: spies.append(
+            _SpyState(alerts_table=alerts_table, baselines_table=baselines_table)
+        )
+        or spies[-1],
+    )
+
+    config = make_config()
+    run(config, seats_client=FakeSeatsAeroClient([]), notifier=FakeNotifier(), heartbeat=FakeHeartbeat())
+
+    assert len(spies) == 1
+    assert spies[0].alerts_table == "flight-tracker-app-alerts"
+    assert spies[0].baselines_table == "flight-tracker-app-baselines"
+
+
+def test_run_raises_clear_error_when_table_name_env_vars_missing(monkeypatch):
+    """No silent fallback to a guessed/default table name -- missing env vars
+    must fail loud and name exactly what's missing, matching src/secrets.py's
+    convention for required config."""
+    import pytest
+
+    monkeypatch.delenv("ALERTS_TABLE_NAME", raising=False)
+    monkeypatch.delenv("BASELINES_TABLE_NAME", raising=False)
+
+    config = make_config()
+    with pytest.raises(RuntimeError, match="ALERTS_TABLE_NAME"):
+        run(config, seats_client=FakeSeatsAeroClient([]), notifier=FakeNotifier(), heartbeat=FakeHeartbeat())
 
 
 def test_run_does_not_close_an_injected_notifier():

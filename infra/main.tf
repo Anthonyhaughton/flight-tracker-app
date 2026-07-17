@@ -9,12 +9,12 @@ terraform {
   }
 
   # Remote state in S3 with a DynamoDB lock table -- never local state.
-  # Bucket/key/region/lock table are environment-specific and deliberately
-  # not hardcoded here; supply them via
-  #   terraform init -backend-config=backend.hcl
-  # (gitignored, one per environment) rather than committing them.
   backend "s3" {
-    encrypt = true
+    bucket         = "flight-tracker-app"
+    key            = "terraform.tfstate"
+    region         = "us-east-1"
+    dynamodb_table = "terraform-locks"
+    encrypt        = true
   }
 }
 

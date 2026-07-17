@@ -59,10 +59,10 @@ On-demand (pay-per-request) billing — at this volume it's pennies. No provisio
 
 ## Secrets & config
 
-- API keys (`SEATS_AERO_API_KEY`, `SERPAPI_KEY`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`)
-  live in **SSM Parameter Store (SecureString)** or Secrets Manager. `secrets.py` reads them
-  at cold start and caches for the invocation. Parameter Store is cheaper for a handful of
-  values; Secrets Manager adds rotation you don't need yet.
+- API keys (`SEATS_AERO_API_KEY`, `DISCORD_WEBHOOK_URL`, `SERPAPI_KEY`, `TELEGRAM_BOT_TOKEN`,
+  `TELEGRAM_CHAT_ID`) live in **SSM Parameter Store (SecureString)** or Secrets Manager.
+  `secrets.py` reads them at cold start and caches for the invocation. Parameter Store is
+  cheaper for a handful of values; Secrets Manager adds rotation you don't need yet.
 - `watchlist.yaml` ships in the deployment package (it's config, not secret). Editing routes
   = redeploy the package (fast) or, later, store it in S3/Parameter Store for hot edits.
 

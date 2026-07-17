@@ -63,6 +63,12 @@ class ScheduleConfig:
 @dataclass(frozen=True)
 class AlertConfig:
     dedup_ttl_days: int
+    # Caps NEW deals alerted in a single poller invocation. Independent of
+    # dedup (which only stops the SAME deal re-alerting on a LATER run) --
+    # this guards against a wide date window or a newly widened/added route
+    # surfacing many qualifying candidates against an empty dedup table in
+    # one run. See src/poller.py's run()/poll_route().
+    max_alerts_per_run: int = 8
 
 
 @dataclass(frozen=True)

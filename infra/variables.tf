@@ -1,7 +1,7 @@
 variable "project_name" {
   description = "Short name used to prefix all resources."
   type        = string
-  default     = "flight-deal-agent"
+  default     = "flight-tracker-app"
 }
 
 variable "environment" {
@@ -38,6 +38,12 @@ variable "award_poll_schedule_expression" {
   description = "EventBridge Scheduler cron/rate expression for the award cached-search poll."
   type        = string
   default     = "rate(20 minutes)"
+}
+
+variable "schedule_enabled" {
+  description = "Whether the EventBridge Schedule that triggers the poller is ENABLED or DISABLED. Default false so the first apply creates everything without the schedule firing -- manually invoke the Lambda once to verify a real run succeeds, then apply again with this set to true."
+  type        = bool
+  default     = false
 }
 
 variable "heartbeat_missing_after_minutes" {

@@ -16,6 +16,8 @@ means a retried run re-evaluates rather than double-alerting.
 from __future__ import annotations
 
 import logging
+import os
+from dataclasses import dataclass
 from typing import Protocol
 
 import boto3
@@ -45,6 +47,31 @@ HEARTBEAT_METRIC = "PollSucceeded"
 
 class Heartbeat(Protocol):
     def emit(self) -> None: ...
+
+
+@dataclass
+class PollStats:
+    """Accumulated across every route/origin in a single run() invocation --
+    passed by reference into poll_route() so the cap (config.alerts.
+    max_alerts_per_run) is enforced across the whole run, not per-route."""
+
+    candidates_evaluated: int = 0
+    alerts_sent: int = 0
+    skipped_duplicate: int = 0
+    skipped_capped: int = 0
+    skipped_other: int = 0
+
+
+def _require_env(var_name: str, purpose: str) -> str:
+    value = os.environ.get(var_name)
+    if not value:
+        raise RuntimeError(
+            f"Missing required environment variable '{var_name}' ({purpose}). "
+            "Expected to be set by infra/lambda.tf's environment.variables block, "
+            "from the real Terraform-created table's .name -- this shouldn't be "
+            "missing in a real deployment."
+        )
+    return value
 
 
 def _build_notifier(notifier_name: str) -> Notifier:
@@ -78,10 +105,13 @@ def poll_route(
     config: WatchlistConfig,
     state: StateStore,
     notifier: Notifier,
-) -> int:
+    *,
+    max_alerts_per_run: int | None = None,
+    stats: PollStats | None = None,
+) -> PollStats:
     wanted_cabins = set(route.cabins)
     start, end = route.date_window.to_dates()
-    alerts_sent = 0
+    stats = stats if stats is not None else PollStats()
 
     for origin in origins:
         try:
@@ -91,19 +121,39 @@ def poll_route(
             break
 
         for award in hits:
+            stats.candidates_evaluated += 1
+
             # Cached Search already carries real per-cabin taxes (award.taxes_usd,
             # None when the program doesn't report them) -- no more 0.0 placeholder.
             verdict = is_high_value(award, config.awards, wanted_cabins, taxes_usd=award.taxes_usd)
             if not verdict.fire:
+                stats.skipped_other += 1
                 continue
 
             key = award_key(award)
             if state.already_alerted(key):
+                stats.skipped_duplicate += 1
+                continue
+
+            # Cap check happens here -- after dedup (so it's independent of
+            # dedup, per the design goal: dedup filters repeats across runs,
+            # this caps NEW deals within a single run), before Get Trips (so
+            # a capped candidate doesn't burn seats.aero quota on a call we
+            # already know won't lead to a send). Log it, don't drop it
+            # silently -- it genuinely matched, it just lost the race for
+            # this run's budget.
+            if max_alerts_per_run is not None and stats.alerts_sent >= max_alerts_per_run:
+                stats.skipped_capped += 1
+                logger.info(
+                    "%s matched but capped (max_alerts_per_run=%d reached this run), skipping send",
+                    award.availability_id, max_alerts_per_run,
+                )
                 continue
 
             trips = client.get_trips(award.availability_id)
             if not trips:
                 logger.info("no trip detail for %s, skipping (space likely gone)", award.availability_id)
+                stats.skipped_other += 1
                 continue
 
             # Get Trips returns itineraries across ALL cabins on this
@@ -115,6 +165,7 @@ def poll_route(
                     "no %s-cabin trip among %d Get Trips result(s) for %s, skipping",
                     award.cabin, len(trips), award.availability_id,
                 )
+                stats.skipped_other += 1
                 continue
 
             # Re-run the gate with Get Trips' taxes. Cached Search already gave
@@ -130,13 +181,14 @@ def poll_route(
             real_verdict = is_high_value(award, config.awards, wanted_cabins, taxes_usd=parse_trip_taxes_usd(trip))
             if not real_verdict.fire:
                 logger.info("%s no longer clears the gate with real taxes, skipping", award.availability_id)
+                stats.skipped_other += 1
                 continue
 
             notifier.send_award_alert(award, real_verdict, trip)
             state.record_alert(key, ttl_seconds=config.alerts.dedup_ttl_days * 86400)
-            alerts_sent += 1
+            stats.alerts_sent += 1
 
-    return alerts_sent
+    return stats
 
 
 def run(
@@ -151,14 +203,31 @@ def run(
     owns_seats_client = seats_client is None
     owns_notifier = notifier is None
     seats_client = seats_client or SeatsAeroClient(secrets.get_seats_aero_api_key())
-    state = state or DynamoStateStore(alerts_table="flight-deal-alerts", baselines_table="flight-deal-baselines")
+    # Table names must come from the real Terraform-created resources (see
+    # infra/lambda.tf's environment.variables block), never a hardcoded
+    # string here -- IAM only grants access to the tables Terraform actually
+    # created (infra/iam.tf), so a stale/guessed name here 403s instead of
+    # 404ing, which is exactly what happened when this was hardcoded.
+    state = state or DynamoStateStore(
+        alerts_table=_require_env("ALERTS_TABLE_NAME", "DynamoDB alerts/dedup table name"),
+        baselines_table=_require_env("BASELINES_TABLE_NAME", "DynamoDB cash-baselines table name"),
+    )
     notifier = notifier or _build_notifier(config.notifier)
     heartbeat = heartbeat or CloudWatchHeartbeat()
 
-    total_alerts = 0
+    stats = PollStats()
     try:
         for route in config.active_routes():
-            total_alerts += poll_route(seats_client, config.origins, route, config, state, notifier)
+            poll_route(
+                seats_client,
+                config.origins,
+                route,
+                config,
+                state,
+                notifier,
+                max_alerts_per_run=config.alerts.max_alerts_per_run,
+                stats=stats,
+            )
     except SeatsAeroAuthError:
         logger.error("seats.aero auth failed; not retrying within this run")
         raise
@@ -170,10 +239,17 @@ def run(
 
     # Only reached on a clean run -- an unhandled exception above (e.g. auth
     # failure) skips this, so a dead/broken poller shows up as a missed
-    # heartbeat rather than a silent, misleading "no alerts."
+    # heartbeat rather than a silent, misleading "no alerts." Logged either
+    # way (0 alerts included) so the logs always make it obvious whether the
+    # cap -- as opposed to dedup or just "no deals" -- was the limiting
+    # factor on a given run.
     heartbeat.emit()
-    logger.info("poll complete: %d alerts sent", total_alerts)
-    return total_alerts
+    logger.info(
+        "poll complete: %d candidate(s) evaluated, %d alert(s) sent, %d skipped as duplicate, "
+        "%d skipped (cap reached)",
+        stats.candidates_evaluated, stats.alerts_sent, stats.skipped_duplicate, stats.skipped_capped,
+    )
+    return stats.alerts_sent
 
 
 def lambda_handler(event, context):

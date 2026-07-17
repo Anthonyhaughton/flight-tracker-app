@@ -1,20 +1,30 @@
 # Placeholder SecureString parameters. Real values are set out-of-band after
 # apply, e.g.:
-#   aws ssm put-parameter --name /flight-deal-agent/seats_aero_api_key \
+#   aws ssm put-parameter --name /flight-tracker-app/seats_aero_api_key \
 #     --type SecureString --value "..." --overwrite
 # Never through a Terraform variable or .tfvars -- `lifecycle.ignore_changes`
 # keeps subsequent applies from clobbering a value set this way.
 #
-# lambda.tf reads these back via `data "aws_ssm_parameter"` with decryption
-# and injects them as the Lambda's environment variables, which means the
-# decrypted values do end up in Terraform state -- treat the state backend
-# (S3 bucket + DynamoDB lock table) as sensitive: SSE encryption and an IAM
-# policy scoped to just this project's deployer. If that tradeoff is
-# unacceptable, switch to resolving these inside secrets.py at Lambda
-# cold-start via boto3 instead of through Terraform.
+# These values are NEVER read back into Terraform (no `data
+# "aws_ssm_parameter"`, no injection into the Lambda's environment block) --
+# the decrypted secret never touches Terraform state or plan output. Instead
+# src/secrets.py resolves them at Lambda cold start via boto3
+# ssm.get_parameter(WithDecryption=true), given only the parameter *name*
+# (not sensitive) via {VAR}_SSM_PARAM env vars set in lambda.tf. See iam.tf
+# for the matching ssm:GetParameter + kms:Decrypt grant.
 
 resource "aws_ssm_parameter" "seats_aero_api_key" {
   name  = "/${var.project_name}/seats_aero_api_key"
+  type  = "SecureString"
+  value = "REPLACE_ME"
+
+  lifecycle {
+    ignore_changes = [value]
+  }
+}
+
+resource "aws_ssm_parameter" "discord_webhook_url" {
+  name  = "/${var.project_name}/discord_webhook_url"
   type  = "SecureString"
   value = "REPLACE_ME"
 
@@ -35,6 +45,18 @@ resource "aws_ssm_parameter" "telegram_bot_token" {
 
 resource "aws_ssm_parameter" "telegram_chat_id" {
   name  = "/${var.project_name}/telegram_chat_id"
+  type  = "SecureString"
+  value = "REPLACE_ME"
+
+  lifecycle {
+    ignore_changes = [value]
+  }
+}
+
+# Not read by any code yet (v1.1 cash-fare provider) -- created now so the
+# IAM grant and Lambda wiring don't need a second infra change when it lands.
+resource "aws_ssm_parameter" "serpapi_key" {
+  name  = "/${var.project_name}/serpapi_key"
   type  = "SecureString"
   value = "REPLACE_ME"
 

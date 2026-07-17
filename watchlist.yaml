@@ -1,24 +1,36 @@
 # watchlist.yaml — config-as-code for the deal agent.
 # Editing this file (not code) changes what gets watched and what counts as a deal.
 
-origins: [IAD, DCA, BWI]
+# DELIBERATELY NARROWED for safe first-production-invoke testing: origins
+# down to IAD only, destinations down to FCO only. Prod has an empty
+# DynamoDB dedup table and no MAX_ALERTS cap (unlike scripts/dry_run.py), so
+# a wide config on the very first live invoke could fan out into many
+# simultaneous real Discord alerts. Widen both back out after a successful,
+# confirmed production run.
+origins: [IAD]
 
 routes:
   - name: "DC → Italy"
     active: true                      # v1.0 scope: award-only, this route only
-    destinations: [FCO, MXP, VCE]     # Rome, Milan, Venice
+    destinations: [FCO]     # Rome, Milan, Venice -- narrowed, see note above
+    # destinations: [FCO, MXP, VCE]     # Rome, Milan, Venice
     cabins: [business, first]         # saver business-class filter (v1.0)
     date_window:
-      # rolling window relative to "today", in days
+      # rolling window relative to "today", in days. end_offset capped at
+      # 150 (~5 months out) -- the outer edge of where booking a trip is
+      # actually actionable, not the ~11-month max seats.aero will return.
+      # A wide window (this used to be 330) combined with an empty prod
+      # dedup table is what caused a 73-alert flood in one real invoke.
+      # Tunable, but widen deliberately, not by accident.
       start_offset: 30
-      end_offset: 330
-  - name: "DC → Europe (broad)"
-    active: false                     # v2 scope: "anywhere in Europe" inspiration search
-    destinations: [LHR, CDG, AMS, FRA, ZRH, LIS, BCN, CPH]
-    cabins: [economy, premium_economy]
-    date_window:
-      start_offset: 30
-      end_offset: 300
+      end_offset: 150
+  # - name: "DC → Europe (broad)"
+  #   active: false                     # v2 scope: "anywhere in Europe" inspiration search
+  #   destinations: [LHR, CDG, AMS, FRA, ZRH, LIS, BCN, CPH]
+  #   cabins: [economy, premium_economy]
+  #   date_window:
+  #     start_offset: 30
+  #     end_offset: 150     # same tightening as DC -> Italy above, for consistency
 
 # --- award valuation ---
 # Saver-vs-dynamic filtering happens at request time (Cached Search's
@@ -48,6 +60,8 @@ schedule:
 # --- alerting ---
 alerts:
   dedup_ttl_days: 5                    # a vanished deal can re-alert after this
+  max_alerts_per_run: 8                # cap on NEW deals alerted in a single invocation
+                                        # (independent of dedup_ttl_days -- see src/poller.py)
 
 # --- notifications ---
 notifier: discord    # discord (default) or telegram -- swap without code changes

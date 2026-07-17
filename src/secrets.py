@@ -1,16 +1,26 @@
 """Runtime secret loading.
 
-Every secret comes from an environment variable: locally via a gitignored
-`.env` (see .env.example), in Lambda via SSM Parameter Store values injected
-as environment variables by the deploy tooling (see infra/secrets.tf). Never
-hardcode a key, and never silently fall back to a fake/default value — a
-missing secret must fail loud and name exactly what's missing and where to
-get it.
+Locally (or anywhere AWS_LAMBDA_FUNCTION_NAME isn't set): every secret comes
+straight from an environment variable, via a gitignored `.env` (see
+.env.example). Never hardcode a key, never silently fall back to a fake
+value -- a missing secret must fail loud and name exactly what's missing and
+where to get it.
+
+In Lambda: Terraform never injects secret *values* as environment variables
+-- that would land decrypted secrets in Terraform state, plan output, and
+the Lambda console's environment-variables view. Instead each secret's SSM
+Parameter Store *name* (not sensitive -- just a path like
+"/flight-tracker-app/seats_aero_api_key") is injected as `{VAR}_SSM_PARAM`
+(see infra/lambda.tf), and this module resolves the real value via boto3
+ssm.get_parameter(WithDecryption=True) at cold start, caching it in-process
+for the lifetime of the container so a warm invocation never re-hits SSM.
 """
 
 from __future__ import annotations
 
 import os
+
+import boto3
 
 
 class MissingSecretError(RuntimeError):
@@ -23,7 +33,39 @@ class MissingSecretError(RuntimeError):
         )
 
 
+# Cold-start cache, keyed by SSM parameter name -- module-level so it
+# persists across warm invocations within the same Lambda container. A
+# plain dict (not functools.lru_cache) so tests can reset it deterministically.
+_ssm_cache: dict[str, str] = {}
+
+
+def _is_lambda() -> bool:
+    return bool(os.environ.get("AWS_LAMBDA_FUNCTION_NAME"))
+
+
+def _resolve_from_ssm(param_name: str) -> str:
+    if param_name not in _ssm_cache:
+        client = boto3.client("ssm")
+        response = client.get_parameter(Name=param_name, WithDecryption=True)
+        _ssm_cache[param_name] = response["Parameter"]["Value"]
+    return _ssm_cache[param_name]
+
+
 def _require(var_name: str, purpose: str, how_to_get_it: str) -> str:
+    if _is_lambda():
+        param_name_var = f"{var_name}_SSM_PARAM"
+        param_name = os.environ.get(param_name_var)
+        if not param_name:
+            raise MissingSecretError(
+                param_name_var,
+                f"SSM Parameter Store path for {purpose}",
+                "set by Terraform (infra/lambda.tf) -- this shouldn't be missing in a real deployment",
+            )
+        value = _resolve_from_ssm(param_name)
+        if not value:
+            raise MissingSecretError(var_name, purpose, how_to_get_it)
+        return value
+
     value = os.environ.get(var_name)
     if not value:
         raise MissingSecretError(var_name, purpose, how_to_get_it)
