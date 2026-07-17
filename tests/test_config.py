@@ -47,17 +47,31 @@ def test_date_window_offsets_from_today():
     assert end == today + datetime.timedelta(days=330)
 
 
-def test_real_watchlist_date_window_is_narrowed_for_safety():
+# Upper bound on end_offset for any active route -- not the tuned value
+# itself (150 today), which is expected to move within this range as routes
+# get tuned. Just wide enough to rule out a regression back toward something
+# like the original 330-day window, not so tight that routine tuning breaks
+# this test for reasons unrelated to a real bug.
+_MAX_SAFE_END_OFFSET_DAYS = 200
+
+
+def test_real_watchlist_date_windows_stay_within_safe_bounds():
     """Regression: the real watchlist.yaml's DC -> Italy route used to have
     end_offset: 330 (~11 months out). Combined with prod having no per-run
     alert cap at the time, that wide window against an empty dedup table
     produced a real 73-alert flood in one invoke. Unlike the other tests in
     this file (which deliberately use the fixture so routine tuning of the
     live config doesn't break them), this one intentionally targets the
-    LIVE watchlist.yaml at the repo root -- it exists specifically to catch
-    someone widening the window back out past the safe range without
-    noticing the guardrail comment above date_window in that file."""
+    LIVE watchlist.yaml at the repo root -- but as a bounds check, not an
+    exact-value match, so tuning end_offset within a safe range (e.g. 120 or
+    180 days) keeps passing; only a regression toward an extreme value like
+    the original 330 fails it."""
     config = load_watchlist()  # real watchlist.yaml, not the fixture
-    italy = next(r for r in config.routes if r.name == "DC → Italy")
-    assert italy.date_window.start_offset == 30
-    assert italy.date_window.end_offset == 150
+    for route in config.active_routes():
+        assert route.date_window.end_offset is not None
+        assert route.date_window.end_offset <= _MAX_SAFE_END_OFFSET_DAYS, (
+            f"{route.name}'s date_window.end_offset "
+            f"({route.date_window.end_offset} days) exceeds the safe bound of "
+            f"{_MAX_SAFE_END_OFFSET_DAYS} -- a wide window against an empty "
+            "dedup table is what caused a 73-alert flood in one real invoke."
+        )
