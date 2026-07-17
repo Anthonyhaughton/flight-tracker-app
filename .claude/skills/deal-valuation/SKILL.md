@@ -43,6 +43,22 @@ Why effective CPP and not raw miles: 120k miles for a $6,000 business seat (5.0 
 screaming deal; 120k miles for a $900 economy seat (0.75 cpp) is a trap. The cash
 comparison is what separates them.
 
+**Two-stage cash pricing, mirroring Cached-Search-then-Get-Trips:**
+`comparable_cash_price_usd` itself comes from a cheap, cached, ISO-week-bucketed baseline
+(see `flight-cash-price-monitor`) — accurate enough to decide who's a *candidate*, but not
+accurate enough to be the number that finalizes a real alert. Day-of-week price variance on
+long-haul business fares can be large, and whichever exact date happened to trigger that
+week's cached lookup becomes the stand-in for every other date in the bucket, which isn't
+trustworthy as the final gating number. So: use the cheap/bucketed price for the FIRST-pass
+gate (the same role Cached Search plays for award data); once a candidate clears every
+other filter (dedup, the per-run alert cap, and the seats.aero Get Trips detail call), spend
+**one additional real cash-provider call** for that specific award's EXACT date to confirm
+the price before finalizing the verdict and sending — the same role Get Trips plays: a
+precision recheck spent only on finalists, not on every candidate, bounded by the same small
+numbers (`max_alerts_per_run`). If the exact-date price fails the floor after all, skip with
+a distinct, logged reason — never silently fall back to the bucketed estimate as if it were
+confirmed.
+
 Per-program floors live in `watchlist.yaml` because "good" differs by currency. Sensible
 starting floors (the owner should tune these):
 
@@ -74,6 +90,15 @@ alert if drop_pct >= min_drop_pct   # e.g., 0.20
 Never alert before a baseline exists (seed the first observation silently). Mistake fares
 show up here as extreme drops — optionally add a separate lower threshold flagged as
 "possible mistake fare, book fast."
+
+**Which baseline number is `baseline_price`?** The tracked baseline (see
+`flight-cash-price-monitor`) holds two numbers: a trailing minimum and an EMA ("typical"
+recent price). Use the **EMA**, not the trailing minimum, as `baseline_price` in the drop
+formula — a documented judgment call: a drop *below the all-time trailing low* would almost
+never fire, since by definition it's the lowest price ever observed, whereas a drop below
+the recent *typical* price is the actual "is this unusually cheap right now" signal a
+flash-sale/mistake-fare alert exists to catch. Still surface the trailing minimum in the
+alert itself for context (e.g. "$4,200 — previous low was $4,500").
 
 ## The saver gate
 
@@ -122,6 +147,20 @@ class StateStore(Protocol):
   double-firing.
 - A *materially better* version of an existing deal (e.g., price crosses into a lower
   bucket) is allowed to re-alert — that's why the bucket is in the key.
+
+**Per-run alert cap, independent of dedup — real incident, not a theoretical concern.**
+Dedup (above) stops the *same* deal from re-alerting on a *later* run. It does nothing to
+stop a *single* run from alerting on many *different* new deals at once — a wide date
+window or a newly widened/added route can surface many qualifying candidates simultaneously
+against an empty dedup table. This happened for real: one production invocation alerted 73
+times in a single run, from an ~11-month date window against a freshly-created (empty)
+dedup table. Add a `max_alerts_per_run` cap (config-as-code in `watchlist.yaml`, e.g. 8),
+enforced across the *whole run* (all routes, both award and cash-drop alerts sharing one
+budget), not per-route. A candidate that clears every other gate but loses the race for that
+run's budget should be logged as "matched but capped" and counted **separately** from
+duplicates in the run summary — don't drop it silently, and don't conflate "skipped as
+duplicate" with "skipped because the cap was reached," since a future run's logs need to
+make it obvious which one was actually the limiting factor.
 
 ## Output of this layer
 

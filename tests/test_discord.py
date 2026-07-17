@@ -4,13 +4,19 @@ import httpx
 import pytest
 import respx
 
+import datetime
+
 from src.notify.discord import (
+    COLOR_CASH_DEAL,
     COLOR_GOOD_DEAL,
     DiscordError,
     DiscordNotifier,
     DiscordValidationError,
     format_award_embed,
+    format_cash_embed,
 )
+from src.providers.cash.base import CashFare
+from src.state import Baseline
 from src.valuation import Verdict
 
 FAKE_WEBHOOK_URL = "https://discord.com/api/webhooks/123456789/fake-token-not-real"
@@ -26,6 +32,15 @@ SAMPLE_TRIP = {
 }
 
 SAMPLE_VERDICT = Verdict(fire=True, reason="saver-equivalent availability", headline="6.5¢/pt vs $5,900 cash")
+
+SAMPLE_FARE = CashFare(
+    origin="IAD", destination="FCO", date=datetime.date(2026, 9, 14), return_date=None,
+    cabin="business", price_usd=4500.0, airline="United", stops=0, deep_link=None,
+)
+SAMPLE_BASELINE = Baseline(
+    trailing_min_usd=5500.0, ema_usd=6000.0, updated_at=datetime.datetime(2026, 7, 1, tzinfo=datetime.timezone.utc)
+)
+SAMPLE_CASH_VERDICT = Verdict(fire=True, reason="cash price drop", headline="$4,500 vs $6,000 baseline (-25%)")
 
 
 # --- format_award_embed: structure ---
@@ -93,6 +108,70 @@ def test_format_award_embed_no_markdown_escaping_needed(saver_business_award):
     fields_by_name = {f["name"]: f["value"] for f in embed["fields"]}
     assert fields_by_name["Date"] == "2026-05-14"  # no "\\-"
     assert fields_by_name["Taxes (USD)"] == "$180.00"  # no "\\."
+
+
+# --- format_cash_embed: structure, distinct from award embeds ---
+
+
+def test_format_cash_embed_structure():
+    embed = format_cash_embed(SAMPLE_FARE, SAMPLE_CASH_VERDICT, SAMPLE_BASELINE)
+
+    assert embed["title"] == "Cash drop - Business IAD -> FCO"
+    assert embed["color"] == COLOR_CASH_DEAL
+    assert embed["color"] != COLOR_GOOD_DEAL  # visually distinct from award alerts
+
+    fields_by_name = {f["name"]: f["value"] for f in embed["fields"]}
+    assert fields_by_name["Cabin"] == "Business"
+    assert fields_by_name["Date"] == "2026-09-14"
+    assert fields_by_name["Price"] == "$4,500"
+    assert fields_by_name["Baseline (typical)"] == "$6,000"
+    assert fields_by_name["Lowest seen"] == "$5,500"
+    assert fields_by_name["Drop"] == "-25%"
+    assert fields_by_name["Airline"] == "United"
+    assert fields_by_name["Stops"] == "0"
+
+    assert embed["footer"]["text"] == SAMPLE_CASH_VERDICT.headline
+    assert "url" not in embed  # SAMPLE_FARE.deep_link is None
+
+
+def test_format_cash_embed_has_no_award_shaped_fields():
+    # A cash alert must not carry award-specific fields (Program, Miles,
+    # Taxes) -- this is a different kind of alert, not a redemption.
+    embed = format_cash_embed(SAMPLE_FARE, SAMPLE_CASH_VERDICT, SAMPLE_BASELINE)
+    names = {f["name"] for f in embed["fields"]}
+    assert names.isdisjoint({"Program", "Miles", "Taxes (USD)", "Nonstop"})
+
+
+def test_format_cash_embed_includes_url_when_fare_has_deep_link():
+    import dataclasses
+
+    fare_with_link = dataclasses.replace(SAMPLE_FARE, deep_link="https://example.com/book")
+    embed = format_cash_embed(fare_with_link, SAMPLE_CASH_VERDICT, SAMPLE_BASELINE)
+    assert embed["url"] == "https://example.com/book"
+
+
+def test_format_cash_embed_drop_percent_uses_previous_baseline_not_current_price():
+    # The drop % must be computed against the baseline BEFORE this
+    # observation -- comparing a price against a baseline already blended
+    # with itself would understate every drop.
+    embed = format_cash_embed(SAMPLE_FARE, SAMPLE_CASH_VERDICT, SAMPLE_BASELINE)
+    fields_by_name = {f["name"]: f["value"] for f in embed["fields"]}
+    # (6000 - 4500) / 6000 = 25%
+    assert fields_by_name["Drop"] == "-25%"
+
+
+@respx.mock
+def test_send_cash_alert_success_on_204():
+    route = respx.post(FAKE_WEBHOOK_URL).mock(return_value=httpx.Response(204))
+    notifier = DiscordNotifier(FAKE_WEBHOOK_URL)
+
+    notifier.send_cash_alert(SAMPLE_FARE, SAMPLE_CASH_VERDICT, SAMPLE_BASELINE)
+
+    assert route.called
+    import json
+
+    payload = json.loads(route.calls[0].request.content)
+    assert payload["embeds"][0]["title"] == "Cash drop - Business IAD -> FCO"
 
 
 # --- send_award_alert / _send_embeds: success (204) ---

@@ -1,0 +1,127 @@
+{
+  "search_metadata": {
+    "id": "68abc1234567890fedcba98",
+    "status": "Success",
+    "json_endpoint": "https://serpapi.com/searches/abc123/def456.json",
+    "created_at": "2026-07-16 12:00:00 UTC",
+    "processed_at": "2026-07-16 12:00:01 UTC",
+    "total_time_taken": 1.23
+  },
+  "search_parameters": {
+    "engine": "google_flights",
+    "departure_id": "IAD",
+    "arrival_id": "FCO",
+    "outbound_date": "2026-09-14",
+    "type": "2",
+    "travel_class": "3",
+    "currency": "USD"
+  },
+  "best_flights": [
+    {
+      "flights": [
+        {
+          "departure_airport": {
+            "name": "Washington Dulles International Airport",
+            "id": "IAD",
+            "time": "2026-09-14 18:20"
+          },
+          "arrival_airport": {
+            "name": "Leonardo da Vinci International Airport",
+            "id": "FCO",
+            "time": "2026-09-15 09:15"
+          },
+          "duration": 535,
+          "airplane": "Airbus A330",
+          "airline": "United",
+          "airline_logo": "https://www.gstatic.com/flights/airline_logos/70px/UA.png",
+          "travel_class": "Business",
+          "flight_number": "UA 986",
+          "extensions": ["Wi-Fi for a fee", "In-seat power & USB outlets"],
+          "legroom": "78 in",
+          "overnight": false,
+          "often_delayed_by_over_30_min": false
+        }
+      ],
+      "layovers": [],
+      "total_duration": 535,
+      "carbon_emissions": {
+        "this_flight": 890000,
+        "typical_for_this_route": 950000,
+        "difference_percent": -6
+      },
+      "price": 5843,
+      "type": "One way",
+      "airline_logo": "https://www.gstatic.com/flights/airline_logos/70px/UA.png",
+      "booking_token": "WyJDalJJZW1ZUmVURjNjMFJoU21WQlIzaGZFZ1oxWTNsdVoyOCIsW1siSUFEIiwiMjAyNi0wOS0xNCJdXV0="
+    }
+  ],
+  "other_flights": [
+    {
+      "flights": [
+        {
+          "departure_airport": {
+            "name": "Washington Dulles International Airport",
+            "id": "IAD",
+            "time": "2026-09-14 21:55"
+          },
+          "arrival_airport": {
+            "name": "Charles de Gaulle Airport",
+            "id": "CDG",
+            "time": "2026-09-15 11:10"
+          },
+          "duration": 470,
+          "airplane": "Boeing 777",
+          "airline": "Air France",
+          "airline_logo": "https://www.gstatic.com/flights/airline_logos/70px/AF.png",
+          "travel_class": "Business",
+          "flight_number": "AF 27",
+          "extensions": ["Wi-Fi for a fee"],
+          "legroom": "76 in",
+          "overnight": true,
+          "often_delayed_by_over_30_min": false
+        },
+        {
+          "departure_airport": {
+            "name": "Charles de Gaulle Airport",
+            "id": "CDG",
+            "time": "2026-09-15 13:05"
+          },
+          "arrival_airport": {
+            "name": "Leonardo da Vinci International Airport",
+            "id": "FCO",
+            "time": "2026-09-15 14:55"
+          },
+          "duration": 110,
+          "airplane": "Airbus A320",
+          "airline": "Air France",
+          "airline_logo": "https://www.gstatic.com/flights/airline_logos/70px/AF.png",
+          "travel_class": "Business",
+          "flight_number": "AF 1704",
+          "extensions": [],
+          "legroom": "30 in",
+          "overnight": false,
+          "often_delayed_by_over_30_min": false
+        }
+      ],
+      "layovers": [
+        {
+          "duration": 115,
+          "name": "Charles de Gaulle Airport",
+          "id": "CDG",
+          "overnight": false
+        }
+      ],
+      "total_duration": 695,
+      "price": 6120,
+      "type": "One way",
+      "airline_logo": "https://www.gstatic.com/flights/airline_logos/70px/AF.png",
+      "booking_token": "WyJDalJJZW1aUmVURjNjMFJoU21WQlIzaGZFZ1oxWTNsdVoyOSIsW1siSUFEIiwiMjAyNi0wOS0xNCJdXV0="
+    }
+  ],
+  "price_insights": {
+    "lowest_price": 5843,
+    "price_level": "typical",
+    "typical_price_range": [5200, 6800],
+    "price_history": [[1752024000, 6200], [1752628800, 5900]]
+  }
+}

@@ -11,7 +11,9 @@ import re
 import httpx
 
 from src.notify.base import Button
+from src.providers.cash.base import CashFare
 from src.providers.seats_aero import AwardAvailability, parse_trip_taxes_usd
+from src.state import Baseline
 from src.valuation import Verdict
 
 _MDV2_SPECIAL = r"_*[]()~`>#+-=|{}.!"
@@ -48,6 +50,9 @@ class TelegramNotifier:
         self, award: AwardAvailability, verdict: Verdict, trip: dict, *, deep_link: str | None = None
     ) -> None:
         self.send(format_award_alert(award, verdict, trip, deep_link=deep_link))
+
+    def send_cash_alert(self, fare: CashFare, verdict: Verdict, baseline: Baseline) -> None:
+        self.send(format_cash_alert(fare, verdict, baseline))
 
     def close(self) -> None:
         self._client.close()
@@ -88,4 +93,24 @@ def format_award_alert(award: AwardAvailability, verdict: Verdict, trip: dict, *
     ]
     if deep_link:
         lines.append(f"\U0001F517 [Book on {esc(program_label)}]({deep_link})")
+    return "\n".join(lines)
+
+
+def format_cash_alert(fare: CashFare, verdict: Verdict, baseline: Baseline) -> str:
+    """`baseline` is the PREVIOUS baseline (before the observation in
+    `fare`) -- src/cash.py's CashBaselineUpdate.previous -- so the drop %
+    shown here reflects what the price was expected to be, not the
+    just-updated value that already includes this observation."""
+    esc = escape_markdown_v2
+    cabin_label = fare.cabin.title()
+    drop_pct = (baseline.ema_usd - fare.price_usd) / baseline.ema_usd * 100 if baseline.ema_usd else 0.0
+
+    lines = [
+        f"\U0001F4C9 *Cash drop* {esc(cabin_label)} {esc(fare.origin)} → {esc(fare.destination)}",
+        f"\U0001F4C5 {esc(fare.date.isoformat())}",
+        f"\U0001F4B5 {esc(f'${fare.price_usd:,.0f}')} vs {esc(f'${baseline.ema_usd:,.0f}')} baseline "
+        f"\\({esc(f'-{drop_pct:.0f}%')}\\)",
+    ]
+    if fare.deep_link:
+        lines.append(f"\U0001F517 [Book flight]({fare.deep_link})")
     return "\n".join(lines)

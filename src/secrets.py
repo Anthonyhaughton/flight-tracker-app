@@ -107,6 +107,6 @@ def get_telegram_chat_id() -> str:
 def get_serpapi_key() -> str:
     return _require(
         "SERPAPI_KEY",
-        "SerpApi key for Google Flights cash fare lookups (not used until v1.1)",
+        "SerpApi key for Google Flights cash fare lookups",
         "https://serpapi.com/ -> dashboard -> API key",
     )

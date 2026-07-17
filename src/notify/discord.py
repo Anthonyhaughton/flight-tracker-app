@@ -18,7 +18,9 @@ import time
 
 import httpx
 
+from src.providers.cash.base import CashFare
 from src.providers.seats_aero import AwardAvailability, parse_trip_taxes_usd
+from src.state import Baseline
 from src.valuation import Verdict
 
 logger = logging.getLogger(__name__)
@@ -32,7 +34,8 @@ MAX_TOTAL_EMBED_CHARS = 6000
 MAX_FIELDS = 25
 MAX_EMBEDS = 10
 
-COLOR_GOOD_DEAL = 0x2ECC71  # green
+COLOR_GOOD_DEAL = 0x2ECC71  # green -- award redemption alerts
+COLOR_CASH_DEAL = 0xF1C40F  # gold -- standalone cash price-drop alerts, visually distinct from award alerts
 
 
 class DiscordError(RuntimeError):
@@ -55,6 +58,10 @@ class DiscordNotifier:
         self, award: AwardAvailability, verdict: Verdict, trip: dict, *, deep_link: str | None = None
     ) -> None:
         embed = format_award_embed(award, verdict, trip, deep_link=deep_link)
+        self._send_embeds([embed])
+
+    def send_cash_alert(self, fare: CashFare, verdict: Verdict, baseline: Baseline) -> None:
+        embed = format_cash_embed(fare, verdict, baseline)
         self._send_embeds([embed])
 
     def close(self) -> None:
@@ -182,4 +189,41 @@ def format_award_embed(award: AwardAvailability, verdict: Verdict, trip: dict, *
     }
     if deep_link:
         embed["url"] = deep_link
+    return embed
+
+
+def format_cash_embed(fare: CashFare, verdict: Verdict, baseline: Baseline) -> dict:
+    """`baseline` is the PREVIOUS baseline (before the observation in `fare`)
+    -- src/cash.py's CashBaselineUpdate.previous -- so "Baseline (typical)"
+    and the drop % shown here reflect what the price was expected to be,
+    not the just-updated value that already includes this observation.
+
+    Separate embed format from format_award_embed (distinct color, no
+    Program/Miles/Taxes fields, its own title prefix) -- this is a cash
+    fare drop, not an award redemption, and showing award-shaped fields
+    here would be misleading."""
+    cabin_label = fare.cabin.title()
+    drop_pct = (baseline.ema_usd - fare.price_usd) / baseline.ema_usd * 100 if baseline.ema_usd else 0.0
+
+    fields = [
+        {"name": "Cabin", "value": cabin_label, "inline": True},
+        {"name": "Date", "value": fare.date.isoformat(), "inline": True},
+        {"name": "Price", "value": f"${fare.price_usd:,.0f}", "inline": True},
+        {"name": "Baseline (typical)", "value": f"${baseline.ema_usd:,.0f}", "inline": True},
+        {"name": "Lowest seen", "value": f"${baseline.trailing_min_usd:,.0f}", "inline": True},
+        {"name": "Drop", "value": f"-{drop_pct:.0f}%", "inline": True},
+        {"name": "Airline", "value": fare.airline or None, "inline": True},
+        {"name": "Stops", "value": str(fare.stops), "inline": True},
+    ]
+    fields = [f for f in fields if f["value"]]  # Discord 400s on empty field values
+
+    embed: dict = {
+        "title": f"Cash drop - {cabin_label} {fare.origin} -> {fare.destination}",
+        "color": COLOR_CASH_DEAL,
+        "fields": fields,
+        "footer": {"text": verdict.headline or "Cash price drop"},
+        "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    }
+    if fare.deep_link:
+        embed["url"] = fare.deep_link
     return embed

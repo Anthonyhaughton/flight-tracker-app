@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import datetime
 
+from src.config import CashConfig
 from src.providers.seats_aero import AwardAvailability
-from src.valuation import compute_effective_cpp, is_high_value, passes_award_prefilter
+from src.state import Baseline
+from src.valuation import compute_effective_cpp, is_cash_price_drop, is_high_value, passes_award_prefilter
 
 
 def test_prefilter_rejects_untracked_cabin(saver_business_award):
@@ -101,3 +103,56 @@ def test_is_high_value_uses_per_program_floor(award_config):
         united_award, award_config, {"business", "first"}, comparable_cash_usd=2000, taxes_usd=56
     )
     assert verdict.fire is True
+
+
+# --- is_cash_price_drop: the second, independent trigger from deal-valuation ---
+
+_CASH_CONFIG = CashConfig(min_drop_pct=0.20, min_drop_abs_usd=150, mistake_fare_pct=0.45)
+
+
+def _baseline(ema_usd: float, trailing_min_usd: float | None = None) -> Baseline:
+    return Baseline(
+        trailing_min_usd=trailing_min_usd if trailing_min_usd is not None else ema_usd,
+        ema_usd=ema_usd,
+        updated_at=datetime.datetime(2026, 7, 1, tzinfo=datetime.timezone.utc),
+    )
+
+
+def test_is_cash_price_drop_fires_above_pct_threshold():
+    # (1000-750)/1000 = 25% drop, clears the 20% floor
+    verdict = is_cash_price_drop(750.0, _baseline(1000.0), _CASH_CONFIG)
+    assert verdict.fire is True
+    assert "cash price drop" in verdict.reason
+
+
+def test_is_cash_price_drop_fires_on_abs_threshold_even_when_pct_is_small():
+    # (2000-1850)/2000 = 7.5%, well under the 20% floor -- but the $150
+    # absolute drop alone is enough per the "or" in the formula.
+    verdict = is_cash_price_drop(1850.0, _baseline(2000.0), _CASH_CONFIG)
+    assert verdict.fire is True
+
+
+def test_is_cash_price_drop_does_not_fire_below_both_thresholds():
+    verdict = is_cash_price_drop(1950.0, _baseline(2000.0), _CASH_CONFIG)  # $50 / 2.5%
+    assert verdict.fire is False
+    assert "below thresholds" in verdict.reason
+
+
+def test_is_cash_price_drop_flags_extreme_drop_as_mistake_fare():
+    # 60% drop clears the 45% mistake-fare threshold
+    verdict = is_cash_price_drop(800.0, _baseline(2000.0), _CASH_CONFIG)
+    assert verdict.fire is True
+    assert verdict.reason == "possible mistake fare"
+
+
+def test_is_cash_price_drop_normal_drop_not_flagged_as_mistake_fare():
+    # 25% drop clears min_drop_pct but not the 45% mistake-fare bar
+    verdict = is_cash_price_drop(1500.0, _baseline(2000.0), _CASH_CONFIG)
+    assert verdict.fire is True
+    assert verdict.reason == "cash price drop"
+
+
+def test_is_cash_price_drop_handles_invalid_zero_baseline():
+    verdict = is_cash_price_drop(500.0, _baseline(0.0), _CASH_CONFIG)
+    assert verdict.fire is False
+    assert "invalid" in verdict.reason

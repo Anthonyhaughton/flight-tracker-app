@@ -8,7 +8,8 @@ consult that skill first — it holds the detailed, current guidance.
 
 Monitor **cash flight prices** and **award (points/miles) availability** out of the
 Washington D.C. airports (IAD, DCA, BWI) toward Europe (Italy first), and push a
-**Telegram alert only when a genuinely high-value deal appears.** High-value is a
+**Discord alert (default notifier; Telegram is a swappable alternate) only when a
+genuinely high-value deal appears.** High-value is a
 computed judgment (see `deal-valuation`), not "any seat exists" — the fastest way to
 kill this project is to spam the owner into muting the bot.
 
@@ -36,7 +37,7 @@ scrapes airline/OTA sites directly to dodge those terms.
                  │  │ dedup (Dynamo) │  │   already alerted? skip.
                  │  └────────────────┘  │
                  │  ┌────────────────┐  │
-                 │  │ telegram send  │──┼──▶ Bot API
+                 │  │ notifier send  │──┼──▶ Discord webhook (default) / Telegram Bot API
                  │  └────────────────┘  │
                  └─────────────────────┘
 ```
@@ -63,7 +64,7 @@ business logic. Do not hardwire a provider into the valuation or alert code.
 | State              | DynamoDB (dedup + baselines)     | `StateStore` interface (SQLite/Redis) |
 | Secrets            | AWS SSM Parameter Store / Secrets Manager | `secrets.py` loader |
 | IaC                | Terraform                       | `infra/` (CDK/SAM alternative) |
-| Notifications      | Telegram Bot API                | `Notifier` interface |
+| Notifications      | Discord webhook (default)       | `Notifier` interface (Telegram is the built-in swappable alternate) |
 
 If the owner wants GCP or a plain VPS instead of AWS, only the `infra/` and `deploy/`
 layers change. The poller, providers, valuation, and notifier are cloud-agnostic
@@ -82,11 +83,13 @@ flight-deal-agent/
 │   │   └── cash/
 │   │       ├── base.py       # CashFareProvider interface
 │   │       └── serpapi.py    # default impl
-│   ├── valuation.py          # CPP + thresholds → "high value?" decision
+│   ├── valuation.py          # CPP + thresholds → "high value?" decision (award + cash-drop)
+│   ├── cash.py                # cash baseline caching/refresh + exact-date confirm step
 │   ├── state.py              # StateStore interface + DynamoDB impl (dedup, baselines)
 │   ├── notify/
 │   │   ├── base.py           # Notifier interface
-│   │   └── telegram.py       # default impl
+│   │   ├── discord.py        # default impl (webhook, rich embeds)
+│   │   └── telegram.py       # swappable alternate impl (bot token, MarkdownV2)
 │   ├── config.py             # loads watchlist.yaml + CPP valuations
 │   └── secrets.py            # pulls API keys from SSM/Secrets Manager
 ├── infra/                    # Terraform
@@ -96,16 +99,19 @@ flight-deal-agent/
 
 ## Non-negotiable conventions
 
-- **Secrets never touch git.** `SEATS_AERO_API_KEY`, `SERPAPI_KEY`, `TELEGRAM_BOT_TOKEN`,
-  `TELEGRAM_CHAT_ID` load at runtime from SSM/Secrets Manager (locally: `.env`, which is
-  gitignored). No key literals in code, tests, or Terraform state. Verify `.gitignore`
-  covers `.env` and `*.tfvars` before the first commit.
+- **Secrets never touch git.** `SEATS_AERO_API_KEY`, `DISCORD_WEBHOOK_URL`, `SERPAPI_KEY`,
+  `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` load at runtime from SSM/Secrets Manager (locally:
+  `.env`, which is gitignored). No key literals in code, tests, or Terraform state. Verify
+  `.gitignore` covers `.env` and `*.tfvars` before the first commit. Local `.env` and the
+  deployed SSM values are two separate stores that do **not** auto-sync — see
+  `secrets-hygiene` (this caused a real production auth failure once).
 - **Config as code.** Routes, cabins, date windows, per-program CPP valuations, and alert
   thresholds live in `watchlist.yaml`, not in code. Adding a route is a config edit, not
   a deploy of new logic.
 - **Dedup is mandatory.** Every alert path goes through the state store. Never send a
-  Telegram message without first checking + recording a dedup key. See `deal-valuation`
-  for the key design.
+  notifier message (Discord or Telegram) without first checking + recording a dedup key.
+  See `deal-valuation` for the key design, including the per-run `max_alerts_per_run` cap
+  (independent of dedup) that guards against many *new* deals firing in a single run.
 - **Respect rate limits.** seats.aero Pro access is a 1,000-calls/day quota that resets at
   00:00 UTC (not a per-minute limit). Poll *Cached Search* frequently and cheaply; spend a
   *Get Trips* call only on a candidate that already cleared the valuation gate, right before
@@ -126,23 +132,44 @@ Defined in full in the `deal-valuation` skill. In one line: an award is worth al
 when it is **saver-priced**, in a **cabin the owner cares about** (business/first for
 long-haul), and its **effective cents-per-point beats the owner's floor for that program**
 — or when a cash fare drops meaningfully below its tracked baseline. Availability alone is
-never the trigger.
+never the trigger. The cash price behind that CPP math is itself two-stage (a cheap,
+cached weekly estimate decides candidacy; one precise real call confirms the exact date
+before a real alert sends) — see `deal-valuation`.
 
 ## Build phases (ship v1 before touching the hard part)
 
 Prove the pipeline end-to-end on the *clean* data source first, then add the part where
 all the anti-bot pain lives.
 
-- **v1.0 — award-only.** seats.aero cached search → saver business-class filter on 2–3
-  routes → valuation gate → dedup → Telegram. No cash scraping yet. Deployed via Terraform.
-- **v1.1 — cash + real valuation.** Add the `CashFareProvider` (SerpApi), track cash
-  baselines, compute true effective-CPP by comparing award cost against live cash.
+- **v1.0 — award-only. ✅ DEPLOYED and confirmed working end-to-end in production.**
+  seats.aero cached search → cabin filter (business/first) → valuation gate → dedup →
+  Discord (default notifier; Telegram is a swappable alternate impl, see
+  `telegram-alerting`). Verified via a real manual Lambda invoke: real seats.aero data →
+  real valuation → a real Discord alert delivered. Deployed via Terraform using a two-phase
+  apply (schedule created disabled, verified with one manual invoke, then enabled — see
+  `aws-serverless-deploy`).
+- **v1.1 — cash + real valuation. ✅ BUILT AND TESTED, ⚠️ NOT YET VERIFIED LIVE END-TO-END.**
+  `CashFareProvider` (SerpApi) implemented against the live API reference; cash baselines
+  (trailing-min + EMA, ISO-week-bucketed to bound provider call volume) with a real
+  exact-date confirm step for finalists before a real alert sends; real effective-CPP
+  gating (`comparable_cash_usd` is no longer always `None`); a second, independent
+  cash-price-drop trigger. 150+ tests pass, all mocked, zero real network. A one-off live
+  smoke test (`scripts/serpapi_smoke_test.py`) confirmed SerpApi's real schema parses
+  cleanly and the one-way/round-trip directionality guard holds against real data — but the
+  full pipeline (real baseline caching, the exact-date confirm, the cash-drop trigger, a
+  real Discord cash-alert embed) has **not yet** been exercised end-to-end against live
+  data. Next step: run `scripts/dry_run.py` live (recently fixed to actually exercise the
+  real v1.1 cash path — it had silently drifted back to v1.0 award-only behavior once
+  already; see `deal-valuation` and `secrets-hygiene`) before calling v1.1
+  production-verified.
 - **v1.2 — controls.** Inline-keyboard mute/snooze, `watchlist.yaml` fully drives routes,
   heartbeat alarm.
 - **v2 — breadth.** "Anywhere in Europe" inspiration search, more programs, mistake-fare
   detection.
 
-Do not start v1.1 until v1.0 delivers a real alert to the owner's phone.
+Do not consider v1.1 production-verified until `scripts/dry_run.py` delivers a real,
+correctly cash-gated award alert (or a correctly suppressed/deduped cash-drop alert) to the
+owner's phone.
 
 ## Skill index
 
@@ -150,9 +177,10 @@ Do not start v1.1 until v1.0 delivers a real alert to the owner's phone.
 |------|-------|
 | Query award availability, cached-search + get-trips strategy, rate limits | `seats-aero-integration` |
 | Fetch cash fares behind a swappable provider interface | `flight-cash-price-monitor` |
-| Decide if a deal is "high value"; CPP math; dedup key design | `deal-valuation` |
-| Send/format Telegram alerts, MarkdownV2 escaping, buttons | `telegram-alerting` |
-| Terraform, Lambda, EventBridge, DynamoDB, secrets, CI/OIDC | `aws-serverless-deploy` |
+| Decide if a deal is "high value"; CPP math; two-stage cash confirm; dedup + alert-cap design | `deal-valuation` |
+| Send/format Discord (default) or Telegram alerts, MarkdownV2 escaping, buttons | `telegram-alerting` |
+| Terraform, Lambda, EventBridge, DynamoDB, secrets, CI/OIDC, packaging gotchas | `aws-serverless-deploy` |
+| Handling API keys/webhooks safely: log-leak patterns, cold-start resolution, local/deployed secret sync | `secrets-hygiene` |
 
 When in doubt about an external API's exact current schema, **fetch the live docs** rather
 than trusting memory — these providers change endpoints and pricing.

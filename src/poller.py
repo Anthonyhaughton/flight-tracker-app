@@ -1,10 +1,25 @@
-"""Lambda entrypoint: orchestrates the v1.0 award-only pipeline.
+"""Lambda entrypoint: orchestrates the v1.1 award + cash pipeline.
 
-seats.aero cached search -> cabin prefilter -> valuation gate -> dedup ->
-Get Trips detail -> notifier alert -> record. There is no live-confirm step:
-Live Search is commercial-partner-only and unavailable on a Pro account, so
-Get Trips (called only on candidates that already cleared the valuation
-gate) is the freshness/detail check instead.
+seats.aero cached search -> cabin prefilter -> cash baseline lookup/refresh
+(week-bucketed) -> valuation gate (real CPP, once cash is available) ->
+dedup -> cap -> Get Trips detail -> exact-date cash confirm (one real
+SerpApi call, only for candidates that already cleared everything else) ->
+final valuation gate -> notifier alert -> record. There is no live-confirm
+step for AWARD space specifically: Live Search is commercial-partner-only
+and unavailable on a Pro account, so Get Trips (called only on candidates
+that already cleared the valuation gate) is the freshness/detail check
+instead. Cash gets its own two-stage version of the same idea: the cheap,
+week-bucketed baseline decides who's a candidate; a precise, exact-date
+call confirms the finalists, because day-of-week fare variance on
+long-haul business routes can be large enough that the week's bucket isn't
+accurate enough to be the number that actually gates a real alert.
+
+The SAME cash baseline lookup also drives the second, independent trigger
+from deal-valuation: a standalone cash-price-drop alert, unrelated to any
+specific award redemption -- see src/cash.py's module docstring for why one
+cached baseline serves both jobs. The cash-drop trigger and the FIRST-pass
+CPP prefilter both intentionally keep using the week-bucketed baseline,
+never the exact-date confirm -- see poll_route's body for why.
 
 Notifier is selected via watchlist.yaml's `notifier` key (discord by
 default; telegram is a swappable alternate impl -- see src/notify/).
@@ -23,10 +38,13 @@ from typing import Protocol
 import boto3
 
 from src import secrets
+from src.cash import confirm_exact_date_price, get_or_refresh_baseline
 from src.config import RouteConfig, WatchlistConfig, load_watchlist
 from src.notify.base import Notifier
 from src.notify.discord import DiscordNotifier
 from src.notify.telegram import TelegramNotifier
+from src.providers.cash.base import CashFareProvider
+from src.providers.cash.serpapi import SerpApiClient
 from src.providers.seats_aero import (
     SeatsAeroAuthError,
     SeatsAeroClient,
@@ -34,8 +52,8 @@ from src.providers.seats_aero import (
     parse_trip_taxes_usd,
     select_trip_for_cabin,
 )
-from src.state import DynamoStateStore, StateStore, award_key
-from src.valuation import is_high_value
+from src.state import DynamoStateStore, StateStore, award_key, cash_key
+from src.valuation import is_cash_price_drop, is_high_value, passes_award_prefilter
 
 logger = logging.getLogger("poller")
 
@@ -53,10 +71,18 @@ class Heartbeat(Protocol):
 class PollStats:
     """Accumulated across every route/origin in a single run() invocation --
     passed by reference into poll_route() so the cap (config.alerts.
-    max_alerts_per_run) is enforced across the whole run, not per-route."""
+    max_alerts_per_run) is enforced across the whole run, not per-route.
+
+    alerts_sent is the TOTAL of both alert kinds (award + cash) and is what
+    max_alerts_per_run gates -- a route producing many cash-drop bucket
+    crossings is exactly the same kind of flood risk as many award
+    candidates, so they share one budget. cash_alerts_sent is a subset of
+    alerts_sent, tracked separately purely so the summary log can show the
+    award/cash split."""
 
     candidates_evaluated: int = 0
     alerts_sent: int = 0
+    cash_alerts_sent: int = 0
     skipped_duplicate: int = 0
     skipped_capped: int = 0
     skipped_other: int = 0
@@ -106,6 +132,7 @@ def poll_route(
     state: StateStore,
     notifier: Notifier,
     *,
+    cash_provider: CashFareProvider | None = None,
     max_alerts_per_run: int | None = None,
     stats: PollStats | None = None,
 ) -> PollStats:
@@ -123,9 +150,74 @@ def poll_route(
         for award in hits:
             stats.candidates_evaluated += 1
 
+            # Cheap, pure-function check before spending a (cheap but not
+            # free) baseline lookup on an award we'd reject anyway -- Cached
+            # Search is already scoped to route.cabins, so this rarely
+            # actually filters anything out in practice, but it's a real
+            # skip when it does.
+            if not passes_award_prefilter(award, wanted_cabins):
+                stats.skipped_other += 1
+                continue
+
+            comparable_cash_usd = None
+            cash_update = None
+            if cash_provider is not None:
+                try:
+                    cash_update = get_or_refresh_baseline(
+                        state, cash_provider,
+                        origin=award.origin, destination=award.destination, cabin=award.cabin,
+                        date=award.date, max_age_minutes=config.schedule.cash_baseline_minutes,
+                    )
+                except Exception:
+                    # A cash-provider hiccup (auth, rate limit, network) must
+                    # not crash the whole poll run -- seats.aero award data
+                    # is still fully usable without a cash comparison, same
+                    # as v1.0's no-cash-provider behavior. See
+                    # .claude/skills/flight-cash-price-monitor.
+                    logger.warning(
+                        "cash baseline lookup failed for %s->%s (%s) on %s, continuing without cash data",
+                        award.origin, award.destination, award.cabin, award.date, exc_info=True,
+                    )
+                else:
+                    if cash_update.current_fare is not None:
+                        comparable_cash_usd = cash_update.current_fare.price_usd
+                    elif cash_update.baseline is not None:
+                        comparable_cash_usd = cash_update.baseline.ema_usd
+
             # Cached Search already carries real per-cabin taxes (award.taxes_usd,
             # None when the program doesn't report them) -- no more 0.0 placeholder.
-            verdict = is_high_value(award, config.awards, wanted_cabins, taxes_usd=award.taxes_usd)
+            verdict = is_high_value(
+                award, config.awards, wanted_cabins, comparable_cash_usd=comparable_cash_usd, taxes_usd=award.taxes_usd
+            )
+
+            # --- independent cash-drop trigger, piggybacking on the SAME
+            # baseline refresh above (not a separate lookup) -- fires
+            # regardless of whether the award itself clears the valuation
+            # gate, since a cash price drop is meaningful on its own. Never
+            # fires on a route's first-ever observation (previous is None).
+            if (
+                cash_update is not None
+                and cash_update.refreshed
+                and cash_update.previous is not None
+                and cash_update.current_fare is not None
+            ):
+                cash_verdict = is_cash_price_drop(cash_update.current_fare.price_usd, cash_update.previous, config.cash)
+                if cash_verdict.fire:
+                    c_key = cash_key(cash_update.current_fare)
+                    if state.already_alerted(c_key):
+                        stats.skipped_duplicate += 1
+                    elif max_alerts_per_run is not None and stats.alerts_sent >= max_alerts_per_run:
+                        stats.skipped_capped += 1
+                        logger.info(
+                            "cash drop %s matched but capped (max_alerts_per_run=%d reached this run), skipping send",
+                            c_key, max_alerts_per_run,
+                        )
+                    else:
+                        notifier.send_cash_alert(cash_update.current_fare, cash_verdict, cash_update.previous)
+                        state.record_alert(c_key, ttl_seconds=config.alerts.dedup_ttl_days * 86400)
+                        stats.alerts_sent += 1
+                        stats.cash_alerts_sent += 1
+
             if not verdict.fire:
                 stats.skipped_other += 1
                 continue
@@ -168,19 +260,56 @@ def poll_route(
                 stats.skipped_other += 1
                 continue
 
-            # Re-run the gate with Get Trips' taxes. Cached Search already gave
-            # us real taxes above (when the program reports them), so this
-            # isn't the first place real numbers appear -- it's a confirmation
-            # against the more authoritative Get Trips figure, which can
-            # differ (fresher crawl, or Cached Search's number was stale).
-            # In v1.0 (no cash provider wired in, so comparable_cash_usd is
-            # always None) this is a no-op; once v1.1 adds real cash
-            # comparison, it's what catches a deal that only cleared the gate
-            # on Cached Search's now-stale taxes. Skip rather than alert on a
+            # If the first-pass gate used real cash data at all, it was the
+            # week-bucketed baseline -- accurate enough to decide who's a
+            # candidate, but day-of-week price variance on long-haul
+            # business fares can be large enough that it isn't trustworthy
+            # as the number that actually gates a real alert. Spend ONE
+            # additional real SerpApi call for this award's EXACT date to
+            # confirm, mirroring why Get Trips itself is only called this
+            # late: only candidates that already cleared dedup/cap/Get Trips
+            # reach here, so this is bounded by the same small numbers, not
+            # spent on every candidate. comparable_cash_usd is None here
+            # whenever no real cash data was available at all (no provider,
+            # or a provider hiccup earlier) -- nothing to confirm in that
+            # case, same v1.0-style prefilter-only pass as before.
+            if comparable_cash_usd is not None:
+                try:
+                    confirmed_cash_usd = confirm_exact_date_price(
+                        cash_provider, origin=award.origin, destination=award.destination,
+                        cabin=award.cabin, date=award.date,
+                    )
+                except Exception:
+                    logger.warning(
+                        "exact-date cash confirm failed for %s, skipping (can't verify real CPP)",
+                        award.availability_id, exc_info=True,
+                    )
+                    confirmed_cash_usd = None
+
+                if confirmed_cash_usd is None:
+                    logger.info(
+                        "%s: no exact-date cash price to confirm the weekly-bucketed estimate, skipping",
+                        award.availability_id,
+                    )
+                    stats.skipped_other += 1
+                    continue
+
+                comparable_cash_usd = confirmed_cash_usd
+
+            # Re-run the gate with Get Trips' taxes AND (when cash data was
+            # used at all) the exact-date-confirmed cash price above, not
+            # the weekly-bucketed one. Cached Search already gave us real
+            # taxes earlier (when the program reports them), so this isn't
+            # the first place real numbers appear -- it's a confirmation
+            # against the more authoritative figures, which can differ
+            # (fresher crawl / stale bucket). Skip rather than alert on a
             # stale verdict.
-            real_verdict = is_high_value(award, config.awards, wanted_cabins, taxes_usd=parse_trip_taxes_usd(trip))
+            real_verdict = is_high_value(
+                award, config.awards, wanted_cabins,
+                comparable_cash_usd=comparable_cash_usd, taxes_usd=parse_trip_taxes_usd(trip),
+            )
             if not real_verdict.fire:
-                logger.info("%s no longer clears the gate with real taxes, skipping", award.availability_id)
+                logger.info("%s no longer clears the gate with real numbers, skipping", award.availability_id)
                 stats.skipped_other += 1
                 continue
 
@@ -195,14 +324,17 @@ def run(
     config: WatchlistConfig | None = None,
     *,
     seats_client: SeatsAeroClient | None = None,
+    cash_provider: CashFareProvider | None = None,
     state: StateStore | None = None,
     notifier: Notifier | None = None,
     heartbeat: Heartbeat | None = None,
 ) -> int:
     config = config or load_watchlist()
     owns_seats_client = seats_client is None
+    owns_cash_provider = cash_provider is None
     owns_notifier = notifier is None
     seats_client = seats_client or SeatsAeroClient(secrets.get_seats_aero_api_key())
+    cash_provider = cash_provider or SerpApiClient(secrets.get_serpapi_key())
     # Table names must come from the real Terraform-created resources (see
     # infra/lambda.tf's environment.variables block), never a hardcoded
     # string here -- IAM only grants access to the tables Terraform actually
@@ -225,6 +357,7 @@ def run(
                 config,
                 state,
                 notifier,
+                cash_provider=cash_provider,
                 max_alerts_per_run=config.alerts.max_alerts_per_run,
                 stats=stats,
             )
@@ -234,6 +367,8 @@ def run(
     finally:
         if owns_seats_client:
             seats_client.close()
+        if owns_cash_provider:
+            cash_provider.close()
         if owns_notifier:
             notifier.close()
 
@@ -245,9 +380,10 @@ def run(
     # factor on a given run.
     heartbeat.emit()
     logger.info(
-        "poll complete: %d candidate(s) evaluated, %d alert(s) sent, %d skipped as duplicate, "
+        "poll complete: %d candidate(s) evaluated, %d alert(s) sent (%d cash), %d skipped as duplicate, "
         "%d skipped (cap reached)",
-        stats.candidates_evaluated, stats.alerts_sent, stats.skipped_duplicate, stats.skipped_capped,
+        stats.candidates_evaluated, stats.alerts_sent, stats.cash_alerts_sent,
+        stats.skipped_duplicate, stats.skipped_capped,
     )
     return stats.alerts_sent
 

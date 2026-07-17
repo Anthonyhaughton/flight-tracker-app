@@ -62,6 +62,34 @@ There's a `Bulk Availability` endpoint too (one program, broad date/region range
 later for "anywhere in Europe" style v2 inspiration search, not needed for v1.0's specific
 routes.
 
+## Get Trips returns ALL cabins for an AvailabilityID — never trust `trips[0]`
+
+**Real bug, shipped once already.** Get Trips does not return only the cabin you searched
+for — it returns every itinerary for that `AvailabilityID` across every cabin on that
+route+date+program. Confirmed against a real call: one business-cabin Cached Search hit's
+Get Trips response held **88 trips** spanning economy/premium-economy/business/first, not
+just business. Naively indexing `trips[0]` is not guaranteed to be — and in that real case
+wasn't — the cabin the poller actually matched on. This shipped a production alert titled
+(and priced) as "Economy" for what was really a business-class award — not just a cosmetic
+title bug, since `MileageCost`/`TotalTaxes`/`RemainingSeats` were also silently the wrong
+cabin's numbers.
+
+Filter Get Trips results by the `Cabin` field before reading anything else off them:
+
+```python
+def select_trip_for_cabin(trips: list[dict], cabin: str) -> dict | None:
+    matching = [t for t in trips if t.get("Cabin") == cabin]
+    if not matching:
+        return None
+    return min(matching, key=lambda t: t.get("MileageCost", float("inf")))
+```
+
+Treat `None` (no trip in the response actually matches the searched cabin) the same as "no
+trip detail at all" — skip rather than alert with data pulled from the wrong cabin. Every
+notifier that formats a Get Trips-derived alert (Discord and Telegram both) must use the
+already-matched `AwardAvailability.cabin` for display, never `trip["Cabin"]` directly, for
+the same reason.
+
 ## Rate limits
 
 Pro API access is **1,000 calls per calendar day**, resetting at 00:00 UTC, with no manual
@@ -169,17 +197,21 @@ class AwardAvailability:
     origin: str
     destination: str
     date: datetime.date
-    program: str          # the "Source" field
-    cabin: str             # normalized from Y/W/J/F
-    miles: int              # parsed from the {X}MileageCost string
-    airlines: list[str]     # parsed from the {X}Airlines comma-string
+    program: str             # the "Source" field
+    cabin: str                # normalized from Y/W/J/F
+    miles: int                 # parsed from the {X}MileageCost string
+    taxes_usd: float | None    # parsed from the {X}TotalTaxes int (cents); None if the
+                                # program doesn't report taxes (see the ambiguity note above)
+    airlines: list[str]        # parsed from the {X}Airlines comma-string
     direct: bool
     seats: int | None
-    availability_id: str    # the "ID" field, used for Get Trips + dedup
+    availability_id: str       # the "ID" field, used for Get Trips + dedup
 
 class SeatsAeroClient:
     def cached_search(self, origin, destinations, start, end, cabins) -> list[AwardAvailability]: ...
     def get_trips(self, availability_id: str) -> list[dict] | None: ...
+
+def select_trip_for_cabin(trips: list[dict], cabin: str) -> dict | None: ...  # see above
 ```
 
 ## Don't
@@ -191,3 +223,6 @@ class SeatsAeroClient:
 - Don't look for a saver/standard boolean on the response — it doesn't exist. Control it via
   the `include_filtered` request param instead (see above).
 - Don't treat `{X}MileageCost` as a number without casting — it's a string on the wire.
+- Don't take `trips[0]` from Get Trips as "the" matching cabin — it returns itineraries
+  across ALL cabins for the AvailabilityID; filter by the `Cabin` field first (see
+  `select_trip_for_cabin` above). This shipped as a real bug once.

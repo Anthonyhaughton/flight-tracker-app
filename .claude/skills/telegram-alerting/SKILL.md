@@ -8,6 +8,22 @@ description: Format and send deal alerts to a Telegram bot, including message te
 Delivery is the easy part of notifications; **not spamming is the hard part**, and that
 lives in `deal-valuation`'s dedup. This skill covers formatting and sending cleanly.
 
+**Discord (webhook-based) is the current default notifier** (`watchlist.yaml`'s
+`notifier: discord`), not Telegram — chosen for zero bot-setup ceremony (no BotFather, no
+chat-id lookup) and richer structured embeds. Telegram remains a fully-supported, swappable
+alternate implementation behind the same `Notifier` interface; this skill documents how to
+build/maintain it. Swapping notifiers is a one-line `watchlist.yaml` config change, zero
+code changes.
+
+Both notifiers share the same real bug and its fix: Get Trips returns itineraries across
+ALL cabins for an `AvailabilityID`, not just the one that was searched — see
+`seats-aero-integration`'s `select_trip_for_cabin`. Before that fix, a business-class award
+alert was titled (and priced) using an economy trip that happened to be `trips[0]`, in
+**both** notifiers, because both formatters trusted the raw Get Trips dict's `Cabin` field
+instead of the already-matched `AwardAvailability.cabin`. If you touch one notifier's
+formatter, check whether the other has (or needs) the same fix — they are not automatically
+kept in sync just because they implement the same interface.
+
 ## Bot setup (one-time, by the owner)
 
 1. Message `@BotFather`, create a bot, get the **bot token** → store as `TELEGRAM_BOT_TOKEN`.
@@ -20,10 +36,27 @@ back; see the inline-keyboard note.)
 
 ## Notifier interface (swap point)
 
+The real interface takes raw domain objects, not a pre-formatted string, so each backend
+renders however it needs to (MarkdownV2 text here, a structured Discord embed there)
+without the poller knowing or caring which one is active:
+
 ```python
 class Notifier(Protocol):
-    def send(self, message: str, buttons: list[Button] | None = None) -> None: ...
+    def send_award_alert(
+        self, award: AwardAvailability, verdict: Verdict, trip: dict, *, deep_link: str | None = None
+    ) -> None: ...
+    def send_cash_alert(self, fare: CashFare, verdict: Verdict, baseline: Baseline) -> None: ...
 ```
+
+`send_cash_alert` has no `deep_link` kwarg, unlike `send_award_alert`: `CashFare` (unlike
+`AwardAvailability`) already carries its own `deep_link` field, so there's nothing for the
+caller to supply separately.
+
+A lower-level `send(message: str, buttons: list[Button] | None = None)` still exists, but
+only as a Telegram-internal primitive that `send_award_alert`/`send_cash_alert` are built
+on top of (Discord has no equivalent — it posts embed payloads directly). Treat `send()` as
+an implementation detail of this module, not part of the interface other code should depend
+on; poller.py only ever calls `send_award_alert`/`send_cash_alert`.
 
 Default impl posts to `https://api.telegram.org/bot<token>/sendMessage`.
 
@@ -68,13 +101,20 @@ Lead with the verdict, make the key numbers scannable, and include a booking lin
 one-line "why" from the valuation layer.
 
 ```
-🎯 *Business saver* IAD → FCO
+🎯 *Business* IAD → FCO
 📅 2026-05-14 (nonstop)
 💳 88,000 Aeroplan + $180  →  4.8¢/pt vs $5,900 cash
 🔗 Book on Aeroplan
 ```
 
-Include, in order: cabin + fare type, route, date + nonstop/stops, the cost (miles + taxes
+No "saver" in the label — there's no per-item saver flag on the wire (see
+`seats-aero-integration`); saver-equivalence comes entirely from the Cached Search
+request-time `include_filtered` param, so claiming it per-item in the message text would
+assert something we can't actually verify from the response. An earlier version of this
+template included it; that was corrected after a live dry run made the wording's false
+implication obvious.
+
+Include, in order: cabin, route, date + nonstop/stops, the cost (miles + taxes
 for award, or price + drop for cash) with the valuation one-liner, and a deep link. For cash
 drops: `💰 $438 (was $690, ↓37%)`.
 
