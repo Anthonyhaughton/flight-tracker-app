@@ -148,28 +148,30 @@ all the anti-bot pain lives.
   real valuation → a real Discord alert delivered. Deployed via Terraform using a two-phase
   apply (schedule created disabled, verified with one manual invoke, then enabled — see
   `aws-serverless-deploy`).
-- **v1.1 — cash + real valuation. ✅ BUILT AND TESTED, ⚠️ NOT YET VERIFIED LIVE END-TO-END.**
+- **v1.1 — cash + real valuation. ✅ PRODUCTION-VERIFIED end-to-end against live data.**
   `CashFareProvider` (SerpApi) implemented against the live API reference; cash baselines
   (trailing-min + EMA, ISO-week-bucketed to bound provider call volume) with a real
   exact-date confirm step for finalists before a real alert sends; real effective-CPP
   gating (`comparable_cash_usd` is no longer always `None`); a second, independent
-  cash-price-drop trigger. 150+ tests pass, all mocked, zero real network. A one-off live
-  smoke test (`scripts/serpapi_smoke_test.py`) confirmed SerpApi's real schema parses
-  cleanly and the one-way/round-trip directionality guard holds against real data — but the
-  full pipeline (real baseline caching, the exact-date confirm, the cash-drop trigger, a
-  real Discord cash-alert embed) has **not yet** been exercised end-to-end against live
-  data. Next step: run `scripts/dry_run.py` live (recently fixed to actually exercise the
-  real v1.1 cash path — it had silently drifted back to v1.0 award-only behavior once
-  already; see `deal-valuation` and `secrets-hygiene`) before calling v1.1
-  production-verified.
+  cash-price-drop trigger. 150+ tests pass, all mocked, zero real network. Live-verified via
+  `scripts/dry_run.py` in both directions: a real run sent a real Discord award alert with a
+  real confirmed price/CPP in the footer (not the v1.0 "no cash comparison yet" placeholder);
+  a follow-up run with `cpp_floors` deliberately inflated to an unreachable value confirmed
+  the real CPP gate correctly rejects — 10/10 real candidates skipped with the expected
+  `"X.Xcpp below PROGRAM floor"` reason, matching the mocked suite's format exactly. Dedup
+  confirmed to record state only on an actual send, never on a valuation-rejected candidate.
+  The cash-drop trigger correctly stayed silent on cold-start baselines (seeds silently,
+  never alerts on first observation); a live warm-baseline drop firing for real is still
+  unobserved, but is expected to need multiple runs over time to occur naturally and is not a
+  blocker for calling v1.1 closed.
 - **v1.2 — controls.** Inline-keyboard mute/snooze, `watchlist.yaml` fully drives routes,
   heartbeat alarm.
 - **v2 — breadth.** "Anywhere in Europe" inspiration search, more programs, mistake-fare
   detection.
 
-Do not consider v1.1 production-verified until `scripts/dry_run.py` delivers a real,
-correctly cash-gated award alert (or a correctly suppressed/deduped cash-drop alert) to the
-owner's phone.
+v1.1 is production-verified: `scripts/dry_run.py` has delivered a real, correctly
+cash-gated award alert to the owner's phone, and a separate run confirmed the real CPP gate
+correctly rejects real candidates that fail the floor.
 
 ## Skill index
 

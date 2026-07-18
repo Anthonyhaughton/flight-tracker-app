@@ -1,56 +1,158 @@
 # watchlist.yaml — config-as-code for the deal agent.
 # Editing this file (not code) changes what gets watched and what counts as a deal.
 
-# DELIBERATELY NARROWED for safe first-production-invoke testing: origins
-# down to IAD only, destinations down to FCO only. Prod has an empty
-# DynamoDB dedup table and no MAX_ALERTS cap (unlike scripts/dry_run.py), so
-# a wide config on the very first live invoke could fan out into many
-# simultaneous real Discord alerts. Widen both back out after a successful,
-# confirmed production run.
+# Top-level default departure airports. Falls back into any route that
+# doesn't set its own `origins:` override (see routes below and
+# src/config.py's RouteConfig.origins) -- DC -> Italy relies on this
+# fallback; DC -> Europe (broad) sets its own override instead.
 origins: [IAD]
+
+# Award "Source" (program) keys eligible to alert on -- the union of Amex
+# Membership Rewards' and Chase Ultimate Rewards' airline transfer partners.
+# Applied as an early prefilter (src/valuation.py's passes_award_prefilter)
+# before any cash lookup or Get Trips call is spent on a candidate -- see
+# src/poller.py.
+#
+# seats.aero's own Concepts doc (https://developers.seats.aero/reference/
+# concepts-copy.md) is NOT fully trustworthy here -- confirmed 2026-07 via a
+# real Cached Search (IAD -> LHR/BCN/MAD, wide date window): `british`
+# (British Airways) and `iberia` (Iberia) both appeared in real results
+# despite being completely absent from that doc's Sources table. Both are
+# included below on the strength of that live data, not the doc.
+#
+# NOT eligible -- Amex MR and/or Chase UR partner airlines still unconfirmed
+# either way: Aer Lingus, ANA, Cathay Pacific, Southwest. These didn't appear
+# in the IAD -> LHR/BCN/MAD check above, but that check used routes those
+# specific programs wouldn't naturally surface anyway (no Dublin/Asia
+# destination was queried) -- this is an absence of evidence, not confirmed
+# evidence of absence, unlike the doc-table-only exclusions this replaced.
+# Re-check with a route more likely to surface them (e.g. a Dublin
+# destination for Aer Lingus) before concluding either way.
+#
+# `lifemiles` (Avianca's actual program name) is included on the strength of
+# a real worked JSON example elsewhere in seats.aero's own Concepts doc, even
+# though it's missing from that doc's summary Sources table -- same kind of
+# doc discrepancy as british/iberia, not yet independently confirmed live the
+# way british/iberia now have been.
+#
+# Do NOT prune this list based on assumptions about which airlines fly to
+# Europe -- award availability reflects each program's alliance/partner
+# network, not just that airline's own routes (e.g. aeromexico's SkyTeam
+# partner access can surface real Europe availability with no AeroMexico
+# metal involved). src/poller.py logs every program seen in real Cached
+# Search results per run, specifically so pruning decisions can be made from
+# real observed data after a couple weeks of runs, not a guess made today.
+#
+# Transfer partnerships change over time (added/dropped) -- re-verify this
+# list periodically, don't treat it as a permanent hardcode.
+eligible_programs:
+  - aeromexico      # Amex MR -> AeroMexico Club Premier
+  - aeroplan        # Amex MR + Chase UR -> Air Canada Aeroplan
+  - british         # Amex MR + Chase UR -> British Airways Executive Club (CONFIRMED live, 2026-07)
+  - flyingblue      # Amex MR + Chase UR -> Air France/KLM Flying Blue
+  - delta           # Amex MR -> Delta SkyMiles
+  - emirates        # Amex MR -> Emirates Skywards
+  - iberia          # Amex MR + Chase UR -> Iberia Plus (CONFIRMED live, 2026-07)
+  - jetblue         # Amex MR + Chase UR -> JetBlue TrueBlue
+  - qantas          # Amex MR -> Qantas Frequent Flyer
+  - singapore       # Amex MR + Chase UR -> Singapore KrisFlyer
+  - virginatlantic  # Amex MR + Chase UR -> Virgin Atlantic Flying Club
+  - united          # Chase UR -> United MileagePlus
+  - lifemiles       # Amex MR -> Avianca LifeMiles (see caveat above)
 
 routes:
   - name: "DC → Italy"
-    active: true                      # v1.0 scope: award-only, this route only
-    destinations: [FCO]     # Rome, Milan, Venice -- narrowed, see note above
-    # destinations: [FCO, MXP, VCE]     # Rome, Milan, Venice
-    cabins: [business, first]         # saver business-class filter (v1.0)
+    active: true
+    # No `origins:` override -- falls back to the top-level [IAD] above,
+    # which already matches what this route wants.
+    destinations: [FCO]
+    cabins: [economy]
     date_window:
-      # rolling window relative to "today", in days. end_offset capped at
-      # 150 (~5 months out) -- the outer edge of where booking a trip is
-      # actually actionable, not the ~11-month max seats.aero will return.
-      # A wide window (this used to be 330) combined with an empty prod
-      # dedup table is what caused a 73-alert flood in one real invoke.
-      # Tunable, but widen deliberately, not by accident.
+      # Narrow ~2-week bracket around 2027-07-07, expressed as an offset
+      # from today (2026-07-18 at the time this was set) so it stays
+      # correct as time passes rather than going stale like a hardcoded
+      # absolute date would -- see DateWindow.to_dates(). Re-derive these
+      # offsets (or just re-anchor the target date) if this route sits
+      # unedited long enough for the offset to drift past the intended
+      # calendar window.
+      start_offset: 347   # -> 2027-06-30 relative to 2026-07-18
+      end_offset: 361      # -> 2027-07-14 relative to 2026-07-18
+    # CPP-gated: no v1.0 cabin-match-only fallback on this route. See
+    # src/valuation.py's is_high_value and the eligible_programs note above.
+    require_cash_comparison: true
+  - name: "DC → Europe (broad)"
+    active: true
+    # Per-route origins override -- excludes DCA, unlike the top-level
+    # default. See src/config.py's RouteConfig.origins.
+    origins: [IAD, BWI]
+    destinations: [LHR, CDG, AMS, FRA, ZRH, LIS, BCN, CPH]
+    cabins: [economy]
+    date_window:
+      # Same ~150-day rolling window as before -- this route is inspiration
+      # search, not the 2027-specific DC -> Italy trip above.
       start_offset: 30
       end_offset: 150
-  # - name: "DC → Europe (broad)"
-  #   active: false                     # v2 scope: "anywhere in Europe" inspiration search
-  #   destinations: [LHR, CDG, AMS, FRA, ZRH, LIS, BCN, CPH]
-  #   cabins: [economy, premium_economy]
-  #   date_window:
-  #     start_offset: 30
-  #     end_offset: 150     # same tightening as DC -> Italy above, for consistency
+    # require_cash_comparison omitted -- defaults to false, preserving the
+    # resilient v1.0-style cabin-match-only fallback when no cash data is
+    # available yet.
 
 # --- award valuation ---
 # Saver-vs-dynamic filtering happens at request time (Cached Search's
 # include_filtered param, left omitted -- see seats-aero-integration skill),
 # not a config knob here: there's no per-item saver field to gate on.
 awards:
-  min_trip_value_usd: 1500             # absolute gate: comparable cash must be worth this
+  # 250 (previously 400, previously 1500 pre-economy). 400 was a first-pass
+  # economy-appropriate guess, never validated against real data. Validated
+  # 2026-07-18 via scripts/dry_run.py --cpp-floor 2.0 --min-trip-value 250
+  # against real IAD->LHR/CDG/AMS/FRA/ZRH/LIS/BCN/CPH economy inventory
+  # (thousands of real candidates): median real trip value across that data
+  # was ~$300-306, sitting ABOVE 250 but BELOW the old 400 -- so 400 was
+  # cutting off the median real candidate on trip value alone, before CPP
+  # ever mattered. 250 was the more consequential of the two threshold
+  # changes; the CPP floor (below) remained the harder constraint even at
+  # 2.0, since real median CPP on that same data was ~0.8-0.83, nowhere near
+  # either 2.0 or 2.5. Global, not per-route, since both active routes are
+  # economy and there's no route left needing the old business/first numbers.
+  min_trip_value_usd: 250
   cpp_floors:                          # cents-per-point required to alert, per program
-    aeroplan:        1.5
-    flying_blue:     1.3
-    aadvantage:      1.5
-    virgin_atlantic: 1.5
-    united:          1.3
-    default:         1.4
+    # 2.0 (previously 2.5). Same 2026-07-18 real-data validation as
+    # min_trip_value_usd above: real median CPP across thousands of real
+    # IAD-Europe economy candidates was ~0.8-0.83cpp -- the vast majority of
+    # real inventory clears neither 2.0 nor 2.5, so this floor is not being
+    # loosened into "anything fires" territory. What DOES clear it
+    # consistently is Virgin Atlantic (real max observed ~2.82cpp across
+    # multiple runs/destinations) -- 2.0 lets that real, repeatable signal
+    # through; 2.5 didn't. Both active routes want the same effective
+    # floor -- with only two routes and no third needing a different number,
+    # raising the shared global dict (rather than adding a route-level
+    # cpp_floor override field) gets the same result with no schema change.
+    # If a future route needs its own floor, a route-level override becomes
+    # worth adding then.
+    aeroplan:        2.0
+    flyingblue:      2.0   # renamed from "flying_blue" -- seats.aero's real Source value has no underscore
+                            # (confirmed against the live Concepts doc); the old spelling could never
+                            # have matched a real award.program and was silently falling through to
+                            # "default" every time.
+    aadvantage:      1.5   # left as-is: American isn't in eligible_programs (no Amex/Chase transfer
+                            # path), so this entry can no longer be reached at all after the
+                            # eligible_programs prefilter -- inert, not deleted, in case that changes.
+    virginatlantic:  2.0   # renamed from "virgin_atlantic" -- same real-Source-key mismatch as flyingblue above.
+    united:          2.0
+    default:         2.0   # covers every other eligible_programs entry (aeromexico, delta, emirates,
+                            # jetblue, qantas, singapore, lifemiles) that has no explicit override above.
 
 # --- cash drop detection ---
 cash:
   min_drop_pct: 0.20                   # alert if fare drops >=20% below baseline
   min_drop_abs_usd: 150                # ...or >=$150 below baseline
-  mistake_fare_pct: 0.45               # flag extreme drops as "possible mistake fare"
+  mistake_fare_pct: 0.45               # flag RELATIVE drops (above) as "possible mistake fare" once this severe
+  # Independent, history-free trigger: ANY one-way price under this fires a
+  # "possible mistake fare" alert regardless of baseline/EMA history --
+  # in addition to (not instead of) the relative drop trigger above, since
+  # it can fire on a route's very first observation, before any baseline
+  # exists. One-way only, matching the rest of the pipeline (see
+  # src/providers/cash/serpapi.py) -- no round-trip variant.
+  mistake_fare_ceiling_usd: 200
 
 # --- polling cadence (minutes) ---
 schedule:

@@ -160,6 +160,21 @@ def test_format_cash_embed_drop_percent_uses_previous_baseline_not_current_price
     assert fields_by_name["Drop"] == "-25%"
 
 
+def test_format_cash_embed_omits_baseline_fields_when_baseline_is_none():
+    # The absolute mistake-fare-ceiling trigger can fire on a route's very
+    # first observation, before any baseline exists -- must format cleanly
+    # (not crash on None.ema_usd) and simply omit the comparison fields
+    # rather than fabricate a baseline.
+    ceiling_verdict = Verdict(fire=True, reason="possible mistake fare (absolute ceiling)", headline="$150 one-way")
+    embed = format_cash_embed(SAMPLE_FARE, ceiling_verdict, None)
+
+    names = {f["name"] for f in embed["fields"]}
+    assert names.isdisjoint({"Baseline (typical)", "Lowest seen", "Drop"})
+    fields_by_name = {f["name"]: f["value"] for f in embed["fields"]}
+    assert fields_by_name["Price"] == "$4,500"  # core fields still present
+    assert embed["footer"]["text"] == ceiling_verdict.headline
+
+
 @respx.mock
 def test_send_cash_alert_success_on_204():
     route = respx.post(FAKE_WEBHOOK_URL).mock(return_value=httpx.Response(204))
@@ -394,6 +409,7 @@ def test_poller_does_not_record_alert_when_discord_send_raises(saver_business_aw
     class FakeConfig:
         awards = config_awards
         alerts = FakeAlertsConfig()
+        eligible_programs = None
 
     state = InMemoryStateStore()
 

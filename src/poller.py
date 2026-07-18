@@ -24,6 +24,16 @@ never the exact-date confirm -- see poll_route's body for why.
 Notifier is selected via watchlist.yaml's `notifier` key (discord by
 default; telegram is a swappable alternate impl -- see src/notify/).
 
+Two more config-driven gates, both applied per candidate: `eligible_programs`
+(top-level watchlist.yaml key, an early prefilter alongside the cabin check
+-- a program not in the set is skipped before any cash lookup or Get Trips
+call) and `require_cash_comparison` (per-route watchlist.yaml key -- when
+True, a candidate with no resolved cash price skips instead of falling back
+to v1.0's cabin-match-only firing). See src/valuation.py.
+
+Origins are resolved per route: `route.origins` overrides the top-level
+`origins` list when set, otherwise the top-level list applies.
+
 Safe to retry: alerts are recorded only after a successful send, and dedup
 means a retried run re-evaluates rather than double-alerting.
 """
@@ -53,7 +63,7 @@ from src.providers.seats_aero import (
     select_trip_for_cabin,
 )
 from src.state import DynamoStateStore, StateStore, award_key, cash_key
-from src.valuation import is_cash_price_drop, is_high_value, passes_award_prefilter
+from src.valuation import is_cash_below_mistake_fare_ceiling, is_cash_price_drop, is_high_value, passes_award_prefilter
 
 logger = logging.getLogger("poller")
 
@@ -147,6 +157,21 @@ def poll_route(
             logger.warning("rate limited on %s from %s, stopping this run: %s", route.name, origin, exc)
             break
 
+        # Observability, not filtering: log every program that actually
+        # showed up in real Cached Search results this run, even if the
+        # candidate is later rejected by eligible_programs/dedup/cap/CPP --
+        # deliberately NOT restricted to config.eligible_programs, so this
+        # also surfaces any program seats.aero tracks that isn't in that
+        # list at all. After a couple weeks of real runs, use this to see
+        # which eligible_programs entries have genuinely produced zero hits
+        # before pruning anything -- see watchlist.yaml's eligible_programs
+        # comment on why we don't prune based on assumptions today.
+        programs_seen = sorted({award.program for award in hits})
+        logger.info(
+            "%s from %s: %d Cached Search hit(s) across program(s): %s",
+            route.name, origin, len(hits), ", ".join(programs_seen) if programs_seen else "none",
+        )
+
         for award in hits:
             stats.candidates_evaluated += 1
 
@@ -155,7 +180,7 @@ def poll_route(
             # Search is already scoped to route.cabins, so this rarely
             # actually filters anything out in practice, but it's a real
             # skip when it does.
-            if not passes_award_prefilter(award, wanted_cabins):
+            if not passes_award_prefilter(award, wanted_cabins, config.eligible_programs):
                 stats.skipped_other += 1
                 continue
 
@@ -187,21 +212,29 @@ def poll_route(
             # Cached Search already carries real per-cabin taxes (award.taxes_usd,
             # None when the program doesn't report them) -- no more 0.0 placeholder.
             verdict = is_high_value(
-                award, config.awards, wanted_cabins, comparable_cash_usd=comparable_cash_usd, taxes_usd=award.taxes_usd
+                award, config.awards, wanted_cabins, comparable_cash_usd=comparable_cash_usd, taxes_usd=award.taxes_usd,
+                require_cash_comparison=route.require_cash_comparison,
             )
 
-            # --- independent cash-drop trigger, piggybacking on the SAME
-            # baseline refresh above (not a separate lookup) -- fires
+            # --- two independent cash triggers, piggybacking on the SAME
+            # baseline refresh above (not a separate lookup) -- fire
             # regardless of whether the award itself clears the valuation
-            # gate, since a cash price drop is meaningful on its own. Never
-            # fires on a route's first-ever observation (previous is None).
-            if (
-                cash_update is not None
-                and cash_update.refreshed
-                and cash_update.previous is not None
-                and cash_update.current_fare is not None
-            ):
-                cash_verdict = is_cash_price_drop(cash_update.current_fare.price_usd, cash_update.previous, config.cash)
+            # gate, since a cash signal is meaningful on its own:
+            #   1. Absolute mistake-fare ceiling (is_cash_below_mistake_fare_ceiling)
+            #      -- fires on ANY fresh observation, including a route's
+            #      very FIRST ever one, since it needs no history at all.
+            #   2. Relative baseline drop (is_cash_price_drop) -- unchanged,
+            #      still requires a pre-existing baseline (previous is not
+            #      None), so it never fires on a first observation.
+            # Checked in that order and share ONE dedup key (cash_key) since
+            # they're both about the same underlying fare observation -- if
+            # the ceiling trigger already matched, the drop trigger is
+            # skipped rather than double-alerting on the identical price.
+            if cash_update is not None and cash_update.refreshed and cash_update.current_fare is not None:
+                cash_verdict = is_cash_below_mistake_fare_ceiling(cash_update.current_fare.price_usd, config.cash)
+                if not cash_verdict.fire and cash_update.previous is not None:
+                    cash_verdict = is_cash_price_drop(cash_update.current_fare.price_usd, cash_update.previous, config.cash)
+
                 if cash_verdict.fire:
                     c_key = cash_key(cash_update.current_fare)
                     if state.already_alerted(c_key):
@@ -307,6 +340,7 @@ def poll_route(
             real_verdict = is_high_value(
                 award, config.awards, wanted_cabins,
                 comparable_cash_usd=comparable_cash_usd, taxes_usd=parse_trip_taxes_usd(trip),
+                require_cash_comparison=route.require_cash_comparison,
             )
             if not real_verdict.fire:
                 logger.info("%s no longer clears the gate with real numbers, skipping", award.availability_id)
@@ -350,9 +384,12 @@ def run(
     stats = PollStats()
     try:
         for route in config.active_routes():
+            # Per-route origins override falls back to the top-level list
+            # when absent -- see RouteConfig.origins and watchlist.yaml.
+            route_origins = route.origins if route.origins is not None else config.origins
             poll_route(
                 seats_client,
-                config.origins,
+                route_origins,
                 route,
                 config,
                 state,

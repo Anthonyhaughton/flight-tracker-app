@@ -1,11 +1,18 @@
 from __future__ import annotations
 
+import dataclasses
 import datetime
 
-from src.config import CashConfig
+from src.config import AwardConfig, CashConfig
 from src.providers.seats_aero import AwardAvailability
 from src.state import Baseline
-from src.valuation import compute_effective_cpp, is_cash_price_drop, is_high_value, passes_award_prefilter
+from src.valuation import (
+    compute_effective_cpp,
+    is_cash_below_mistake_fare_ceiling,
+    is_cash_price_drop,
+    is_high_value,
+    passes_award_prefilter,
+)
 
 
 def test_prefilter_rejects_untracked_cabin(saver_business_award):
@@ -14,6 +21,22 @@ def test_prefilter_rejects_untracked_cabin(saver_business_award):
 
 def test_prefilter_accepts_tracked_cabin(saver_business_award):
     assert passes_award_prefilter(saver_business_award, {"business", "first"}) is True
+
+
+def test_prefilter_accepts_eligible_program(saver_business_award):
+    # saver_business_award.program == "aeroplan"
+    assert passes_award_prefilter(saver_business_award, {"business", "first"}, {"aeroplan", "united"}) is True
+
+
+def test_prefilter_rejects_ineligible_program(saver_business_award):
+    assert passes_award_prefilter(saver_business_award, {"business", "first"}, {"united", "delta"}) is False
+
+
+def test_prefilter_eligible_programs_none_means_unrestricted(saver_business_award):
+    # None (the default/omitted case) must not filter on program at all --
+    # pre-eligible_programs behavior, unchanged for callers that don't pass it.
+    assert passes_award_prefilter(saver_business_award, {"business", "first"}) is True
+    assert passes_award_prefilter(saver_business_award, {"business", "first"}, None) is True
 
 
 def test_compute_effective_cpp_screaming_deal():
@@ -73,6 +96,36 @@ def test_is_high_value_with_cash_skips_below_min_trip_value(saver_business_award
     assert "trip value" in verdict.reason
 
 
+def test_is_high_value_economy_fare_clears_lowered_min_trip_value(saver_business_award):
+    # Realistic IAD-Europe economy one-way ($650, matching the live SerpApi
+    # economy fixture's ~$689-742 range) with otherwise-good CPP. The old
+    # min_trip_value_usd=1500 (a business/first number) would reject this
+    # outright regardless of CPP; the economy-appropriate 400 must not.
+    economy_config = AwardConfig(min_trip_value_usd=400, cpp_floors={"default": 2.5})
+    economy_award = dataclasses.replace(saver_business_award, cabin="economy", miles=20000)
+    # trip value = 650 - 75 = 575 >= 400 floor; cpp = (650-75)/20000*100 = 2.875cpp >= 2.5 floor
+    verdict = is_high_value(economy_award, economy_config, {"economy"}, comparable_cash_usd=650, taxes_usd=75)
+    assert verdict.fire is True
+    assert "trip value" not in verdict.reason
+
+
+def test_is_high_value_economy_fare_still_rejected_by_old_business_floor():
+    # Documents the bug the fix addresses: the SAME realistic economy fare
+    # from the test above WOULD have been rejected purely on trip value
+    # under the old 1500 business/first floor, even with identical
+    # (otherwise-clearing) CPP -- proving 400 is what changed the outcome,
+    # not the CPP math.
+    old_business_config = AwardConfig(min_trip_value_usd=1500, cpp_floors={"default": 2.5})
+    economy_award = AwardAvailability(
+        origin="IAD", destination="FCO", date=datetime.date(2027, 7, 5), program="united", cabin="economy",
+        miles=20000, taxes_usd=75.0, airlines=["UA"], direct=True, seats=4,
+        availability_id="united-iad-fco-2027-07-05-economy",
+    )
+    verdict = is_high_value(economy_award, old_business_config, {"economy"}, comparable_cash_usd=650, taxes_usd=75)
+    assert verdict.fire is False
+    assert "trip value" in verdict.reason
+
+
 def test_is_high_value_skips_when_taxes_unknown(saver_business_award, award_config):
     # taxes_usd=None (e.g. a Qatar/Turkish/Singapore hit) must never be
     # silently treated as $0 -- that would inflate the effective CPP and
@@ -82,6 +135,37 @@ def test_is_high_value_skips_when_taxes_unknown(saver_business_award, award_conf
     )
     assert verdict.fire is False
     assert "taxes unknown" in verdict.reason
+
+
+def test_is_high_value_no_cash_data_falls_back_when_require_cash_comparison_false(saver_business_award, award_config):
+    # require_cash_comparison defaults to False -- must preserve the exact
+    # v1.0-style cabin-match-only fallback, unchanged.
+    verdict = is_high_value(saver_business_award, award_config, {"business", "first"}, comparable_cash_usd=None)
+    assert verdict.fire is True
+    assert verdict.reason == "saver-equivalent availability in a tracked cabin"
+
+
+def test_is_high_value_no_cash_data_skips_when_require_cash_comparison_true(saver_business_award, award_config):
+    verdict = is_high_value(
+        saver_business_award, award_config, {"business", "first"},
+        comparable_cash_usd=None, require_cash_comparison=True,
+    )
+    assert verdict.fire is False
+    assert verdict.reason == "no cash data available yet for CPP-gated route, skipping"
+
+
+def test_is_high_value_require_cash_comparison_true_still_gates_normally_once_cash_resolves(
+    saver_business_award, award_config
+):
+    # require_cash_comparison only changes the "no cash data at all" branch --
+    # once a real comparable_cash_usd exists, the normal CPP/trip-value gate
+    # applies exactly as it would with require_cash_comparison=False.
+    verdict = is_high_value(
+        saver_business_award, award_config, {"business", "first"},
+        comparable_cash_usd=5900, taxes_usd=180, require_cash_comparison=True,
+    )
+    assert verdict.fire is True
+    assert "cpp" in verdict.reason
 
 
 def test_is_high_value_uses_per_program_floor(award_config):
@@ -156,3 +240,33 @@ def test_is_cash_price_drop_handles_invalid_zero_baseline():
     verdict = is_cash_price_drop(500.0, _baseline(0.0), _CASH_CONFIG)
     assert verdict.fire is False
     assert "invalid" in verdict.reason
+
+
+# --- is_cash_below_mistake_fare_ceiling: third, independent cash trigger,
+# fires with NO baseline/history required at all ---
+
+
+def test_is_cash_below_mistake_fare_ceiling_fires_under_ceiling():
+    verdict = is_cash_below_mistake_fare_ceiling(180.0, _CASH_CONFIG)
+    assert verdict.fire is True
+    assert verdict.reason == "possible mistake fare (absolute ceiling)"
+    assert "180" in verdict.headline
+
+
+def test_is_cash_below_mistake_fare_ceiling_does_not_fire_at_ceiling():
+    # _CASH_CONFIG.mistake_fare_ceiling_usd defaults to 200.0 -- exactly AT
+    # the ceiling must not fire (only strictly under it).
+    verdict = is_cash_below_mistake_fare_ceiling(200.0, _CASH_CONFIG)
+    assert verdict.fire is False
+    assert "at/above" in verdict.reason
+
+
+def test_is_cash_below_mistake_fare_ceiling_does_not_fire_above_ceiling():
+    verdict = is_cash_below_mistake_fare_ceiling(250.0, _CASH_CONFIG)
+    assert verdict.fire is False
+
+
+def test_is_cash_below_mistake_fare_ceiling_respects_configured_value():
+    custom_config = dataclasses.replace(_CASH_CONFIG, mistake_fare_ceiling_usd=100.0)
+    assert is_cash_below_mistake_fare_ceiling(150.0, custom_config).fire is False
+    assert is_cash_below_mistake_fare_ceiling(90.0, custom_config).fire is True

@@ -16,9 +16,12 @@ cash baseline (see src/cash.py), so stage 2 actually gates alerts.
 cash data yet -- rather than blocking the whole award pipeline on cash
 being available.
 
-This module also owns the second, independent trigger from deal-valuation:
-`is_cash_price_drop()`, a standalone cash-fare-drop alert unrelated to any
-specific award redemption.
+This module also owns two independent cash-fare triggers from deal-valuation,
+both unrelated to any specific award redemption: `is_cash_price_drop()` (a
+relative drop below the recent baseline/EMA) and
+`is_cash_below_mistake_fare_ceiling()` (an absolute price ceiling, fires
+regardless of baseline history -- including on a route's very first
+observation, unlike the drop trigger).
 
 `taxes_usd` is an explicit argument rather than always read off
 `AwardAvailability.taxes_usd` because the poller calls this twice: once on
@@ -45,8 +48,20 @@ class Verdict:
     headline: str
 
 
-def passes_award_prefilter(award: AwardAvailability, wanted_cabins: set[str]) -> bool:
-    return award.cabin in wanted_cabins
+def passes_award_prefilter(
+    award: AwardAvailability, wanted_cabins: set[str], eligible_programs: set[str] | None = None
+) -> bool:
+    """eligible_programs is the set of seats.aero source keys reachable via
+    the owner's actual transfer partnerships (see watchlist.yaml's
+    eligible_programs). None means unrestricted -- pre-eligible_programs
+    behavior, and what every caller that doesn't care about this axis gets
+    by default. A candidate whose program isn't eligible is rejected here,
+    before a cash lookup or Get Trips call is ever spent on it."""
+    if award.cabin not in wanted_cabins:
+        return False
+    if eligible_programs is not None and award.program not in eligible_programs:
+        return False
+    return True
 
 
 def compute_effective_cpp(comparable_cash_usd: float, taxes_fees_usd: float, miles: int) -> float:
@@ -61,11 +76,14 @@ def is_high_value(
     wanted_cabins: set[str],
     comparable_cash_usd: float | None = None,
     taxes_usd: float | None = None,
+    require_cash_comparison: bool = False,
 ) -> Verdict:
     if not passes_award_prefilter(award, wanted_cabins):
         return Verdict(False, "cabin not tracked", "")
 
     if comparable_cash_usd is None:
+        if require_cash_comparison:
+            return Verdict(False, "no cash data available yet for CPP-gated route, skipping", "")
         headline = f"{award.miles:,} {award.program} pts (no cash comparison yet)"
         return Verdict(True, "saver-equivalent availability in a tracked cabin", headline)
 
@@ -85,6 +103,26 @@ def is_high_value(
 
     headline = f"{cpp:.1f}¢/pt vs ${comparable_cash_usd:,.0f} cash"
     return Verdict(True, f"{cpp:.1f}cpp >= {award.program} floor {floor:.1f}cpp", headline)
+
+
+def is_cash_below_mistake_fare_ceiling(current_price_usd: float, config: CashConfig) -> Verdict:
+    """A third, independent cash trigger, alongside is_cash_price_drop:
+    ANY one-way price under config.mistake_fare_ceiling_usd is flagged as a
+    possible mistake fare regardless of baseline/EMA history -- unlike
+    is_cash_price_drop, this has no history requirement at all, so the
+    caller (poller.py) may invoke it even on a route's very first-ever
+    observation, before any baseline exists. One-way only, matching the rest
+    of the pipeline's deliberate one-way-only cash pricing (see
+    src/providers/cash/serpapi.py's module docstring) -- there is no
+    round-trip variant of this check."""
+    if current_price_usd >= config.mistake_fare_ceiling_usd:
+        return Verdict(
+            False,
+            f"${current_price_usd:,.0f} at/above the ${config.mistake_fare_ceiling_usd:,.0f} mistake-fare ceiling",
+            "",
+        )
+    headline = f"${current_price_usd:,.0f} one-way (mistake-fare ceiling ${config.mistake_fare_ceiling_usd:,.0f})"
+    return Verdict(True, "possible mistake fare (absolute ceiling)", headline)
 
 
 def is_cash_price_drop(current_price_usd: float, baseline: Baseline, config: CashConfig) -> Verdict:

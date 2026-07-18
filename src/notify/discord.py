@@ -60,7 +60,7 @@ class DiscordNotifier:
         embed = format_award_embed(award, verdict, trip, deep_link=deep_link)
         self._send_embeds([embed])
 
-    def send_cash_alert(self, fare: CashFare, verdict: Verdict, baseline: Baseline) -> None:
+    def send_cash_alert(self, fare: CashFare, verdict: Verdict, baseline: Baseline | None) -> None:
         embed = format_cash_embed(fare, verdict, baseline)
         self._send_embeds([embed])
 
@@ -192,26 +192,38 @@ def format_award_embed(award: AwardAvailability, verdict: Verdict, trip: dict, *
     return embed
 
 
-def format_cash_embed(fare: CashFare, verdict: Verdict, baseline: Baseline) -> dict:
+def format_cash_embed(fare: CashFare, verdict: Verdict, baseline: Baseline | None) -> dict:
     """`baseline` is the PREVIOUS baseline (before the observation in `fare`)
     -- src/cash.py's CashBaselineUpdate.previous -- so "Baseline (typical)"
     and the drop % shown here reflect what the price was expected to be,
     not the just-updated value that already includes this observation.
+
+    `baseline` may be None: the absolute mistake-fare-ceiling trigger (see
+    src/valuation.py's is_cash_below_mistake_fare_ceiling) fires regardless
+    of history, including on a route's very first-ever observation, before
+    any baseline exists at all -- in that case there's nothing to compare
+    against, so the baseline/drop fields are simply omitted rather than
+    crashing on None.
 
     Separate embed format from format_award_embed (distinct color, no
     Program/Miles/Taxes fields, its own title prefix) -- this is a cash
     fare drop, not an award redemption, and showing award-shaped fields
     here would be misleading."""
     cabin_label = fare.cabin.title()
-    drop_pct = (baseline.ema_usd - fare.price_usd) / baseline.ema_usd * 100 if baseline.ema_usd else 0.0
 
     fields = [
         {"name": "Cabin", "value": cabin_label, "inline": True},
         {"name": "Date", "value": fare.date.isoformat(), "inline": True},
         {"name": "Price", "value": f"${fare.price_usd:,.0f}", "inline": True},
-        {"name": "Baseline (typical)", "value": f"${baseline.ema_usd:,.0f}", "inline": True},
-        {"name": "Lowest seen", "value": f"${baseline.trailing_min_usd:,.0f}", "inline": True},
-        {"name": "Drop", "value": f"-{drop_pct:.0f}%", "inline": True},
+    ]
+    if baseline is not None:
+        drop_pct = (baseline.ema_usd - fare.price_usd) / baseline.ema_usd * 100 if baseline.ema_usd else 0.0
+        fields += [
+            {"name": "Baseline (typical)", "value": f"${baseline.ema_usd:,.0f}", "inline": True},
+            {"name": "Lowest seen", "value": f"${baseline.trailing_min_usd:,.0f}", "inline": True},
+            {"name": "Drop", "value": f"-{drop_pct:.0f}%", "inline": True},
+        ]
+    fields += [
         {"name": "Airline", "value": fare.airline or None, "inline": True},
         {"name": "Stops", "value": str(fare.stops), "inline": True},
     ]

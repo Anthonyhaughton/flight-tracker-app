@@ -36,6 +36,17 @@ class RouteConfig:
     cabins: list[str]
     date_window: DateWindow
     active: bool = True
+    # Per-route override of the top-level origins list. None (the default)
+    # means "use the top-level origins list" -- most routes don't need their
+    # own set of departure airports, so this only exists for the routes that
+    # actually differ (e.g. a route that excludes DCA).
+    origins: list[str] | None = None
+    # When True, a candidate on this route with no resolved cash price (no
+    # provider wired up, SerpApi found nothing, or the provider errored)
+    # must NOT fall back to v1.0's cabin-match-only firing -- it skips
+    # instead. False (the default) preserves that resilient fallback exactly
+    # as it always has. See src/valuation.py's is_high_value.
+    require_cash_comparison: bool = False
 
 
 @dataclass(frozen=True)
@@ -52,6 +63,14 @@ class CashConfig:
     min_drop_pct: float
     min_drop_abs_usd: float
     mistake_fare_pct: float
+    # Independent, history-free trigger: ANY one-way price under this fires a
+    # "possible mistake fare" alert regardless of baseline/EMA history -- in
+    # addition to (not instead of) the relative baseline-drop trigger above,
+    # since it must be able to fire on a route's very first observation,
+    # before any baseline exists at all. See src/valuation.py's
+    # is_cash_below_mistake_fare_ceiling. Defaulted so existing CashConfig(...)
+    # call sites that predate this field don't break.
+    mistake_fare_ceiling_usd: float = 200.0
 
 
 @dataclass(frozen=True)
@@ -80,6 +99,14 @@ class WatchlistConfig:
     schedule: ScheduleConfig
     alerts: AlertConfig
     notifier: str = "discord"  # "discord" (default) or "telegram" -- swap without code changes
+    # Award "Source" (program) keys eligible to alert on -- e.g. the seats.aero
+    # source keys reachable via the owner's actual transfer partnerships. None
+    # (the default) means unrestricted, matching pre-eligible_programs
+    # behavior. Re-verify periodically: transfer partnerships get added and
+    # dropped over time, see the comment above eligible_programs in
+    # watchlist.yaml. Applied as an early prefilter, before dedup/cap/cash
+    # lookups -- see src/valuation.py's passes_award_prefilter.
+    eligible_programs: list[str] | None = None
 
     def active_routes(self) -> list[RouteConfig]:
         return [r for r in self.routes if r.active]
@@ -94,6 +121,8 @@ def load_watchlist(path: str | Path = DEFAULT_WATCHLIST_PATH) -> WatchlistConfig
             cabins=r["cabins"],
             date_window=DateWindow(**r["date_window"]),
             active=r.get("active", True),
+            origins=r.get("origins"),
+            require_cash_comparison=r.get("require_cash_comparison", False),
         )
         for r in raw["routes"]
     ]
@@ -105,4 +134,5 @@ def load_watchlist(path: str | Path = DEFAULT_WATCHLIST_PATH) -> WatchlistConfig
         schedule=ScheduleConfig(**raw["schedule"]),
         alerts=AlertConfig(**raw["alerts"]),
         notifier=raw.get("notifier", "discord"),
+        eligible_programs=raw.get("eligible_programs"),
     )

@@ -51,7 +51,7 @@ class TelegramNotifier:
     ) -> None:
         self.send(format_award_alert(award, verdict, trip, deep_link=deep_link))
 
-    def send_cash_alert(self, fare: CashFare, verdict: Verdict, baseline: Baseline) -> None:
+    def send_cash_alert(self, fare: CashFare, verdict: Verdict, baseline: Baseline | None) -> None:
         self.send(format_cash_alert(fare, verdict, baseline))
 
     def close(self) -> None:
@@ -96,21 +96,32 @@ def format_award_alert(award: AwardAvailability, verdict: Verdict, trip: dict, *
     return "\n".join(lines)
 
 
-def format_cash_alert(fare: CashFare, verdict: Verdict, baseline: Baseline) -> str:
+def format_cash_alert(fare: CashFare, verdict: Verdict, baseline: Baseline | None) -> str:
     """`baseline` is the PREVIOUS baseline (before the observation in
     `fare`) -- src/cash.py's CashBaselineUpdate.previous -- so the drop %
     shown here reflects what the price was expected to be, not the
-    just-updated value that already includes this observation."""
+    just-updated value that already includes this observation.
+
+    `baseline` may be None: the absolute mistake-fare-ceiling trigger (see
+    src/valuation.py's is_cash_below_mistake_fare_ceiling) fires regardless
+    of history, including on a route's very first-ever observation -- in
+    that case there's nothing to compare against, so the baseline/drop line
+    is simply omitted."""
     esc = escape_markdown_v2
     cabin_label = fare.cabin.title()
-    drop_pct = (baseline.ema_usd - fare.price_usd) / baseline.ema_usd * 100 if baseline.ema_usd else 0.0
 
     lines = [
         f"\U0001F4C9 *Cash drop* {esc(cabin_label)} {esc(fare.origin)} → {esc(fare.destination)}",
         f"\U0001F4C5 {esc(fare.date.isoformat())}",
-        f"\U0001F4B5 {esc(f'${fare.price_usd:,.0f}')} vs {esc(f'${baseline.ema_usd:,.0f}')} baseline "
-        f"\\({esc(f'-{drop_pct:.0f}%')}\\)",
     ]
+    if baseline is not None:
+        drop_pct = (baseline.ema_usd - fare.price_usd) / baseline.ema_usd * 100 if baseline.ema_usd else 0.0
+        lines.append(
+            f"\U0001F4B5 {esc(f'${fare.price_usd:,.0f}')} vs {esc(f'${baseline.ema_usd:,.0f}')} baseline "
+            f"\\({esc(f'-{drop_pct:.0f}%')}\\)"
+        )
+    else:
+        lines.append(f"\U0001F4B5 {esc(f'${fare.price_usd:,.0f}')} one-way")
     if fare.deep_link:
         lines.append(f"\U0001F517 [Book flight]({fare.deep_link})")
     return "\n".join(lines)

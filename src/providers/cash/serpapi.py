@@ -56,6 +56,17 @@ class SerpApiRateLimitError(SerpApiError):
     pass
 
 
+class SerpApiTimeoutError(SerpApiError):
+    """A transient network-level timeout (httpx.TimeoutException), distinct
+    from auth/quota failures -- the request may or may not have completed
+    server-side (we never got a response either way), so callers should
+    treat this as "unknown, safe to skip and retry later," not as a sign
+    the key/quota is broken. Queries far out on the calendar (sparse/slow
+    upstream data, e.g. Google Flights ~1 year ahead) appear more likely to
+    hit this than near-term ones -- confirmed via a real
+    scripts/dry_run.py run against a 2027 date."""
+
+
 class SerpApiClient:
     """Implements the CashFareProvider protocol (src/providers/cash/base.py)."""
 
@@ -136,7 +147,10 @@ class SerpApiClient:
         return _parse_itinerary(cheapest, origin, destination, date, cabin)
 
     def _get(self, params: dict) -> dict:
-        response = self._client.get(BASE_URL, params=params)
+        try:
+            response = self._client.get(BASE_URL, params=params)
+        except httpx.TimeoutException as exc:
+            raise SerpApiTimeoutError(f"SerpApi request timed out ({type(exc).__name__}): {exc}") from exc
 
         if response.status_code == 401:
             raise SerpApiAuthError(

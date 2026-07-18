@@ -5,16 +5,22 @@
 
 origins: [IAD, DCA, BWI]
 
+eligible_programs: [aeroplan, united, flyingblue]
+
 routes:
   - name: "DC → Italy"
     active: true
+    # No origins override -- must fall back to the top-level list above.
     destinations: [FCO, MXP, VCE]
     cabins: [business, first]
     date_window:
       start_offset: 30
       end_offset: 330
+    require_cash_comparison: true
   - name: "DC → Europe (broad)"
     active: false
+    # Explicit origins override -- must take priority over the top-level list.
+    origins: [IAD, BWI]
     destinations: [LHR, CDG, AMS, FRA, ZRH, LIS, BCN, CPH]
     cabins: [economy, premium_economy]
     date_window:

@@ -37,6 +37,47 @@ def test_cpp_floor_falls_back_to_default():
     assert config.awards.cpp_floor("some_unlisted_program") == config.awards.cpp_floors["default"]
 
 
+def test_eligible_programs_loads_from_top_level_key():
+    config = load_watchlist(FIXTURE_PATH)
+    assert config.eligible_programs == ["aeroplan", "united", "flyingblue"]
+
+
+def test_eligible_programs_defaults_to_none_when_absent(tmp_path):
+    # None means unrestricted -- must not silently become an empty (i.e.
+    # everything-rejected) list when the key is simply omitted.
+    fixture_no_eligible = tmp_path / "no_eligible_programs.yaml"
+    text = FIXTURE_PATH.read_text()
+    lines = [line for line in text.splitlines() if not line.startswith("eligible_programs:")]
+    fixture_no_eligible.write_text("\n".join(lines))
+
+    config = load_watchlist(fixture_no_eligible)
+    assert config.eligible_programs is None
+
+
+def test_route_without_origins_override_falls_back_to_top_level():
+    config = load_watchlist(FIXTURE_PATH)
+    italy = next(r for r in config.routes if r.name == "DC → Italy")
+    assert italy.origins is None
+
+
+def test_route_with_origins_override_is_parsed():
+    config = load_watchlist(FIXTURE_PATH)
+    europe = next(r for r in config.routes if r.name == "DC → Europe (broad)")
+    assert europe.origins == ["IAD", "BWI"]
+
+
+def test_require_cash_comparison_true_when_set():
+    config = load_watchlist(FIXTURE_PATH)
+    italy = next(r for r in config.routes if r.name == "DC → Italy")
+    assert italy.require_cash_comparison is True
+
+
+def test_require_cash_comparison_defaults_false_when_absent():
+    config = load_watchlist(FIXTURE_PATH)
+    europe = next(r for r in config.routes if r.name == "DC → Europe (broad)")
+    assert europe.require_cash_comparison is False
+
+
 def test_date_window_offsets_from_today():
     config = load_watchlist(FIXTURE_PATH)
     italy = next(r for r in config.routes if r.name == "DC → Italy")
@@ -47,31 +88,103 @@ def test_date_window_offsets_from_today():
     assert end == today + datetime.timedelta(days=330)
 
 
-# Upper bound on end_offset for any active route -- not the tuned value
-# itself (150 today), which is expected to move within this range as routes
-# get tuned. Just wide enough to rule out a regression back toward something
-# like the original 330-day window, not so tight that routine tuning breaks
-# this test for reasons unrelated to a real bug.
-_MAX_SAFE_END_OFFSET_DAYS = 200
+# Upper bound on a route's date_window WIDTH (end_offset - start_offset),
+# not its raw end_offset -- see test_real_watchlist_date_windows_stay_within_safe_bounds's
+# docstring for why width is the right invariant, not absolute distance from
+# today. Not the tuned value itself, which is expected to move within this
+# range as routes get tuned. Just wide enough to rule out a regression back
+# toward something like the original 330-day-wide window, not so tight that
+# routine tuning breaks this test for reasons unrelated to a real bug.
+_MAX_SAFE_WINDOW_WIDTH_DAYS = 200
 
 
 def test_real_watchlist_date_windows_stay_within_safe_bounds():
     """Regression: the real watchlist.yaml's DC -> Italy route used to have
-    end_offset: 330 (~11 months out). Combined with prod having no per-run
-    alert cap at the time, that wide window against an empty dedup table
-    produced a real 73-alert flood in one invoke. Unlike the other tests in
-    this file (which deliberately use the fixture so routine tuning of the
-    live config doesn't break them), this one intentionally targets the
-    LIVE watchlist.yaml at the repo root -- but as a bounds check, not an
-    exact-value match, so tuning end_offset within a safe range (e.g. 120 or
-    180 days) keeps passing; only a regression toward an extreme value like
-    the original 330 fails it."""
+    start_offset: 0(-ish), end_offset: 330 -- a ~330-day-WIDE rolling window.
+    Combined with prod having no per-run alert cap at the time, that wide
+    window against an empty dedup table produced a real 73-alert flood in one
+    invoke, because a wide window surfaces many distinct candidate
+    dates/awards at once.
+
+    Checked as WIDTH (end_offset - start_offset), not raw end_offset: a
+    narrow (~2-week) window anchored far in the future -- e.g. DC -> Italy's
+    2027-07-07 bracket, offsets ~347-361 -- has the same small
+    number-of-candidates profile as a narrow window anchored 30 days out. It
+    was never the distance from today that caused the flood, it was the
+    SPAN. Raw end_offset alone would incorrectly flag a legitimate
+    far-future-but-narrow bracket as unsafe.
+
+    Unlike the other tests in this file (which deliberately use the fixture
+    so routine tuning of the live config doesn't break them), this one
+    intentionally targets the LIVE watchlist.yaml at the repo root -- but as
+    a bounds check, not an exact-value match, so tuning within a safe range
+    keeps passing; only a regression toward an extreme WIDE window like the
+    original 330-day-wide one fails it."""
     config = load_watchlist()  # real watchlist.yaml, not the fixture
     for route in config.active_routes():
-        assert route.date_window.end_offset is not None
-        assert route.date_window.end_offset <= _MAX_SAFE_END_OFFSET_DAYS, (
-            f"{route.name}'s date_window.end_offset "
-            f"({route.date_window.end_offset} days) exceeds the safe bound of "
-            f"{_MAX_SAFE_END_OFFSET_DAYS} -- a wide window against an empty "
-            "dedup table is what caused a 73-alert flood in one real invoke."
+        width = route.date_window.end_offset - route.date_window.start_offset
+        assert width <= _MAX_SAFE_WINDOW_WIDTH_DAYS, (
+            f"{route.name}'s date_window width "
+            f"({width} days, offsets {route.date_window.start_offset}-{route.date_window.end_offset}) "
+            f"exceeds the safe bound of {_MAX_SAFE_WINDOW_WIDTH_DAYS} -- a wide window against an "
+            "empty dedup table is what caused a 73-alert flood in one real invoke."
         )
+
+
+def test_2027_italy_window_brackets_target_date_as_relative_offset():
+    """DC -> Italy's date_window is meant to bracket 2027-07-07 with a
+    ~2-week window -- but per DateWindow's shape (start_offset/end_offset
+    ints only, no date fields), it MUST be expressed as an offset from
+    today, not a hardcoded absolute date that would silently go stale as
+    real time passes. Proven two ways: (1) with "today" pinned to when this
+    route was configured, the realized window actually brackets the
+    intended target date; (2) shifting "today" shifts the realized window by
+    the same amount -- a hardcoded absolute date could never do that."""
+    config = load_watchlist()  # real watchlist.yaml, not the fixture
+    italy = next(r for r in config.active_routes() if r.name == "DC → Italy")
+
+    today = datetime.date(2026, 7, 18)
+    start, end = italy.date_window.to_dates(today=today)
+    assert start <= datetime.date(2027, 7, 7) <= end
+    assert (end - start).days <= 21  # "roughly 2 weeks", not a whole month
+
+    # Relative-offset proof: a hardcoded absolute date would NOT shift when
+    # "today" shifts -- an offset-based one shifts by exactly the same delta.
+    shifted_today = today + datetime.timedelta(days=100)
+    shifted_start, shifted_end = italy.date_window.to_dates(today=shifted_today)
+    assert shifted_start == start + datetime.timedelta(days=100)
+    assert shifted_end == end + datetime.timedelta(days=100)
+
+
+def test_real_watchlist_thresholds_match_validated_values():
+    """Regression: min_trip_value_usd=250 and cpp_floor=2.0 (both eligible
+    per-program entries and the 'default' fallback) were validated 2026-07-18
+    against real IAD-Europe economy data via scripts/dry_run.py's
+    --cpp-floor/--min-trip-value CLI overrides (thousands of real
+    candidates; median real trip value ~$300-306, median real CPP
+    ~0.8-0.83cpp) before being committed here as the real config -- unlike
+    the CLI overrides (in-memory only, never touched this file), this test
+    targets the LIVE watchlist.yaml at the repo root specifically to catch a
+    regression back to the old, unvalidated 400/2.5 numbers, or a partial
+    edit that updates 'default' but misses a per-program override (which
+    would silently keep that program on the old floor, since cpp_floor()
+    prefers a per-program entry over 'default')."""
+    config = load_watchlist()  # real watchlist.yaml, not the fixture
+    assert config.awards.min_trip_value_usd == 250
+
+    # Every program actually reachable via eligible_programs must clear the
+    # SAME validated floor -- not just 'default', since a per-program entry
+    # left on the old value would silently override it for that program.
+    assert config.eligible_programs is not None
+    reachable_programs_with_explicit_floors = set(config.eligible_programs) & set(config.awards.cpp_floors)
+    assert reachable_programs_with_explicit_floors, "expected at least one eligible program to have an explicit cpp_floor entry"
+    for program in reachable_programs_with_explicit_floors:
+        assert config.awards.cpp_floor(program) == 2.0, f"{program}'s cpp_floor was not updated to the validated 2.0"
+
+    assert config.awards.cpp_floors["default"] == 2.0
+
+    # aadvantage is deliberately left untouched (American isn't in
+    # eligible_programs, so this entry is inert) -- confirms the update was
+    # scoped to reachable programs + default, not an indiscriminate
+    # find-replace across the whole cpp_floors dict.
+    assert config.awards.cpp_floors.get("aadvantage") == 1.5

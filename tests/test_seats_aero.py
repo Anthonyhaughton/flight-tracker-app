@@ -113,6 +113,39 @@ def test_parse_item_treats_missing_taxes_field_as_none_even_for_reporting_progra
 
 
 @respx.mock
+def test_cached_search_parses_economy_award():
+    """Economy hasn't been exercised end-to-end before (v1.0/v1.1 only ever
+    used business/first) -- a real-schema-shaped economy fixture (all four
+    cabins' fields present, only YAvailable true, per the real wire shape),
+    not just a relabeled business fixture, to actually prove the Y-prefix
+    cabin-code mapping (_CABIN_CODES) works, not just that "economy" is a
+    valid dict key."""
+    respx.get("https://seats.aero/partnerapi/search").mock(
+        return_value=httpx.Response(200, json=load_fixture("seats_aero_cached_search_economy.json"))
+    )
+    client = SeatsAeroClient(api_key="fake-key")
+
+    results = client.cached_search(
+        origin="IAD",
+        destinations=["FCO"],
+        start=datetime.date(2027, 6, 30),
+        end=datetime.date(2027, 7, 14),
+        cabins=["economy"],
+    )
+
+    assert len(results) == 1
+    award = results[0]
+    assert award.cabin == "economy"
+    assert award.program == "united"
+    assert award.miles == 30000
+    assert isinstance(award.miles, int)  # YMileageCost is a string on the wire, same as JMileageCost
+    assert award.taxes_usd == 75.50
+    assert award.airlines == ["UA"]
+    assert award.direct is True
+    assert award.seats == 4
+
+
+@respx.mock
 def test_cached_search_skips_unavailable_cabins():
     respx.get("https://seats.aero/partnerapi/search").mock(
         return_value=httpx.Response(200, json=load_fixture("seats_aero_cached_search.json"))

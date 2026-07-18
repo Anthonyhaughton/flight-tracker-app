@@ -1,0 +1,47 @@
+{
+  "data": [
+    {
+      "ID": "united-iad-fco-2027-07-05-economy",
+      "RouteID": "9XyzAbC123DEfGhI456jKlMn7",
+      "Route": {
+        "OriginAirport": "IAD",
+        "OriginRegion": "North America",
+        "DestinationAirport": "FCO",
+        "DestinationRegion": "Europe",
+        "Distance": 4548,
+        "Source": "united"
+      },
+      "Date": "2027-07-05",
+      "ParsedDate": "2027-07-05T00:00:00Z",
+      "YAvailable": true,
+      "YMileageCost": "30000",
+      "YTotalTaxes": 7550,
+      "YRemainingSeats": 4,
+      "YAirlines": "UA",
+      "YDirect": true,
+      "WAvailable": false,
+      "WMileageCost": "0",
+      "WTotalTaxes": 0,
+      "WRemainingSeats": 0,
+      "WAirlines": "",
+      "WDirect": false,
+      "JAvailable": false,
+      "JMileageCost": "0",
+      "JTotalTaxes": 0,
+      "JRemainingSeats": 0,
+      "JAirlines": "",
+      "JDirect": false,
+      "FAvailable": false,
+      "FMileageCost": "0",
+      "FTotalTaxes": 0,
+      "FRemainingSeats": 0,
+      "FAirlines": "",
+      "FDirect": false,
+      "Source": "united",
+      "CreatedAt": "2027-06-01T00:00:00Z",
+      "UpdatedAt": "2027-06-15T00:00:00Z",
+      "AvailabilityTrips": null
+    }
+  ],
+  "hasMore": false
+}

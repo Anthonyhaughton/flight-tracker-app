@@ -6,7 +6,7 @@ import httpx
 import pytest
 import respx
 
-from src.providers.cash.serpapi import SerpApiAuthError, SerpApiClient, SerpApiRateLimitError
+from src.providers.cash.serpapi import SerpApiAuthError, SerpApiClient, SerpApiRateLimitError, SerpApiTimeoutError
 from tests.conftest import load_fixture
 
 
@@ -104,6 +104,40 @@ def test_discards_itinerary_when_all_results_are_non_one_way():
     assert fares == []
 
 
+@respx.mock
+def test_search_parses_economy_fare_with_real_schema_fixture():
+    """Economy hasn't been exercised end-to-end before -- a real-schema-shaped
+    economy fixture (travel_class="Economy" per-leg, search_parameters.
+    travel_class="1", genuinely economy-range pricing), not a relabeled
+    business fixture, to actually prove the request-side travel_class
+    mapping and response parsing both work for this cabin, not just that
+    "economy" is a valid dict key."""
+    respx.get("https://serpapi.com/search").mock(
+        return_value=httpx.Response(200, json=load_fixture("serpapi_google_flights_economy.json"))
+    )
+    client = SerpApiClient(api_key="fake-key")
+    fares = client.search("IAD", ["FCO"], datetime.date(2027, 7, 5), datetime.date(2027, 7, 5), "economy")
+
+    assert len(fares) == 1
+    fare = fares[0]
+    assert fare.cabin == "economy"
+    assert fare.price_usd == 689.0  # cheapest across best_flights ($742) and other_flights ($689)
+    assert fare.airline == "Lufthansa"
+    assert fare.stops == 1
+
+
+@respx.mock
+def test_request_maps_economy_cabin_to_travel_class_one():
+    route = respx.get("https://serpapi.com/search").mock(
+        return_value=httpx.Response(200, json=load_fixture("serpapi_google_flights_economy.json"))
+    )
+    client = SerpApiClient(api_key="fake-key")
+    client.search("IAD", ["FCO"], datetime.date(2027, 7, 5), datetime.date(2027, 7, 5), "economy")
+
+    query = dict(httpx.QueryParams(route.calls[0].request.url.query))
+    assert query["travel_class"] == "1"  # economy, per SerpApi's reference
+
+
 # --- travel_class mapping ---
 
 
@@ -169,6 +203,20 @@ def test_429_raises_serpapi_rate_limit_error():
     client = SerpApiClient(api_key="fake-key", max_retries=0)
     with pytest.raises(SerpApiRateLimitError, match="429"):
         client.search("IAD", ["FCO"], datetime.date(2026, 9, 14), datetime.date(2026, 9, 14), "business")
+
+
+@respx.mock
+def test_network_timeout_raises_typed_serpapi_timeout_error():
+    """Regression: a raw httpx.TimeoutException (e.g. a slow response on a
+    far-future date) used to propagate uncaught and crash any caller --
+    confirmed via a real scripts/dry_run.py run against a 2027 date. Must be
+    wrapped into a typed, catchable error distinct from auth/rate-limit
+    failures, since it means something different (transient, not "the key
+    or quota is broken")."""
+    respx.get("https://serpapi.com/search").mock(side_effect=httpx.ReadTimeout("timed out"))
+    client = SerpApiClient(api_key="fake-key", max_retries=0)
+    with pytest.raises(SerpApiTimeoutError):
+        client.search("IAD", ["FCO"], datetime.date(2027, 7, 5), datetime.date(2027, 7, 5), "economy")
 
 
 @respx.mock

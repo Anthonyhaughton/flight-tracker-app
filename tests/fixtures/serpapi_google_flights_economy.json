@@ -1,0 +1,127 @@
+{
+  "search_metadata": {
+    "id": "68abc9998887776665554",
+    "status": "Success",
+    "json_endpoint": "https://serpapi.com/searches/xyz789/uvw012.json",
+    "created_at": "2027-06-01 09:00:00 UTC",
+    "processed_at": "2027-06-01 09:00:01 UTC",
+    "total_time_taken": 0.98
+  },
+  "search_parameters": {
+    "engine": "google_flights",
+    "departure_id": "IAD",
+    "arrival_id": "FCO",
+    "outbound_date": "2027-07-05",
+    "type": "2",
+    "travel_class": "1",
+    "currency": "USD"
+  },
+  "best_flights": [
+    {
+      "flights": [
+        {
+          "departure_airport": {
+            "name": "Washington Dulles International Airport",
+            "id": "IAD",
+            "time": "2027-07-05 17:40"
+          },
+          "arrival_airport": {
+            "name": "Leonardo da Vinci International Airport",
+            "id": "FCO",
+            "time": "2027-07-06 08:35"
+          },
+          "duration": 535,
+          "airplane": "Boeing 787-9",
+          "airline": "United",
+          "airline_logo": "https://www.gstatic.com/flights/airline_logos/70px/UA.png",
+          "travel_class": "Economy",
+          "flight_number": "UA 986",
+          "extensions": ["Carbon emissions estimate: 620 kg"],
+          "legroom": "31 in",
+          "overnight": true,
+          "often_delayed_by_over_30_min": false
+        }
+      ],
+      "layovers": [],
+      "total_duration": 535,
+      "carbon_emissions": {
+        "this_flight": 620000,
+        "typical_for_this_route": 700000,
+        "difference_percent": -11
+      },
+      "price": 742,
+      "type": "One way",
+      "airline_logo": "https://www.gstatic.com/flights/airline_logos/70px/UA.png",
+      "booking_token": "WyJDalJJZW1aUmVURjNjMFJoU21WQlIzaGZFZ1oxWTNsdVoyOSIsW1siSUFEIiwiMjAyNy0wNy0wNSJdXV0="
+    }
+  ],
+  "other_flights": [
+    {
+      "flights": [
+        {
+          "departure_airport": {
+            "name": "Washington Dulles International Airport",
+            "id": "IAD",
+            "time": "2027-07-05 21:10"
+          },
+          "arrival_airport": {
+            "name": "Frankfurt Airport",
+            "id": "FRA",
+            "time": "2027-07-06 10:35"
+          },
+          "duration": 500,
+          "airplane": "Airbus A350-900",
+          "airline": "Lufthansa",
+          "airline_logo": "https://www.gstatic.com/flights/airline_logos/70px/LH.png",
+          "travel_class": "Economy",
+          "flight_number": "LH 419",
+          "extensions": [],
+          "legroom": "30 in",
+          "overnight": true,
+          "often_delayed_by_over_30_min": false
+        },
+        {
+          "departure_airport": {
+            "name": "Frankfurt Airport",
+            "id": "FRA",
+            "time": "2027-07-06 12:20"
+          },
+          "arrival_airport": {
+            "name": "Leonardo da Vinci International Airport",
+            "id": "FCO",
+            "time": "2027-07-06 14:00"
+          },
+          "duration": 100,
+          "airplane": "Airbus A320",
+          "airline": "Lufthansa",
+          "airline_logo": "https://www.gstatic.com/flights/airline_logos/70px/LH.png",
+          "travel_class": "Economy",
+          "flight_number": "LH 236",
+          "extensions": [],
+          "legroom": "29 in",
+          "overnight": false,
+          "often_delayed_by_over_30_min": false
+        }
+      ],
+      "layovers": [
+        {
+          "duration": 105,
+          "name": "Frankfurt Airport",
+          "id": "FRA",
+          "overnight": false
+        }
+      ],
+      "total_duration": 605,
+      "price": 689,
+      "type": "One way",
+      "airline_logo": "https://www.gstatic.com/flights/airline_logos/70px/LH.png",
+      "booking_token": "WyJDalJJZW1aUmVURjNjMFJoU21WQlIzaGZFZ1oxWTNsdVoyOSIsW1siSUFEIiwiMjAyNy0wNy0wNSJdXV0="
+    }
+  ],
+  "price_insights": {
+    "lowest_price": 689,
+    "price_level": "typical",
+    "typical_price_range": [650, 950],
+    "price_history": [[1780000000, 720], [1780600000, 689]]
+  }
+}

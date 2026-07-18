@@ -17,8 +17,10 @@ class FakeSeatsAeroClient:
     def __init__(self, hits: list[AwardAvailability]):
         self._hits = hits
         self.get_trips_calls: list[str] = []
+        self.cached_search_origins: list[str] = []
 
     def cached_search(self, origin, destinations, start, end, cabins) -> list[AwardAvailability]:
+        self.cached_search_origins.append(origin)
         return [h for h in self._hits if h.origin == origin and h.destination in destinations and h.cabin in cabins]
 
     def get_trips(self, availability_id: str):
@@ -168,7 +170,7 @@ def test_poller_passes_real_taxes_to_first_valuation_call(monkeypatch):
 
     calls = []
 
-    def spy_is_high_value(award, config, wanted_cabins, comparable_cash_usd=None, taxes_usd=None):
+    def spy_is_high_value(award, config, wanted_cabins, comparable_cash_usd=None, taxes_usd=None, require_cash_comparison=False):
         calls.append(taxes_usd)
         return Verdict(True, "stub", "stub")
 
@@ -603,6 +605,142 @@ def test_poller_dedups_repeat_cash_drop_alerts():
     assert len(notifier.cash_sent) == 1  # unchanged
 
 
+# --- is_cash_below_mistake_fare_ceiling: third, independent cash trigger ---
+
+
+def test_poller_fires_mistake_fare_ceiling_on_first_observation_no_baseline_needed():
+    """Unlike is_cash_price_drop, the absolute ceiling trigger must fire even
+    on a route's very FIRST observation -- no pre-existing baseline
+    required, unlike every other cash trigger test in this file."""
+    config = make_config()
+    award = make_award()
+    state = InMemoryStateStore()
+    notifier = FakeNotifier()
+    heartbeat = FakeHeartbeat()
+
+    run(
+        config, cash_provider=FakeCashFareProvider([[make_fare(price_usd=150.0)]]),  # under the $200 default ceiling
+        seats_client=FakeSeatsAeroClient([award]), state=state, notifier=notifier, heartbeat=heartbeat,
+    )
+
+    assert len(notifier.cash_sent) == 1
+    fare_sent, verdict_sent, baseline_sent = notifier.cash_sent[0]
+    assert fare_sent.price_usd == 150.0
+    assert verdict_sent.reason == "possible mistake fare (absolute ceiling)"
+    assert baseline_sent is None  # no baseline existed yet -- must not crash or fabricate one
+
+
+def test_poller_mistake_fare_ceiling_dedups_like_cash_drop():
+    config = make_config()
+    award = make_award()
+    state = InMemoryStateStore()
+    notifier = FakeNotifier()
+    heartbeat = FakeHeartbeat()
+
+    run(
+        config, cash_provider=FakeCashFareProvider([[make_fare(price_usd=150.0)]]),
+        seats_client=FakeSeatsAeroClient([award]), state=state, notifier=notifier, heartbeat=heartbeat,
+    )
+    assert len(notifier.cash_sent) == 1
+
+    _force_baseline_stale(state, "IAD", "FCO", "business", award.date)
+    run(
+        config, cash_provider=FakeCashFareProvider([[make_fare(price_usd=150.0)]]),  # same $50-bucket price again
+        seats_client=FakeSeatsAeroClient([award]), state=state, notifier=notifier, heartbeat=heartbeat,
+    )
+
+    assert len(notifier.cash_sent) == 1  # unchanged -- deduped, not re-sent
+
+
+def test_poller_mistake_fare_ceiling_does_not_fire_above_ceiling_on_first_observation():
+    config = make_config()
+    award = make_award()
+    state = InMemoryStateStore()
+    notifier = FakeNotifier()
+    heartbeat = FakeHeartbeat()
+
+    run(
+        config, cash_provider=FakeCashFareProvider([[make_fare(price_usd=6000.0)]]),  # well above the ceiling
+        seats_client=FakeSeatsAeroClient([award]), state=state, notifier=notifier, heartbeat=heartbeat,
+    )
+
+    assert notifier.cash_sent == []
+
+
+def test_poller_mistake_fare_ceiling_takes_priority_over_relative_drop_no_double_alert():
+    """If a price is BOTH under the absolute ceiling AND a big relative drop
+    from baseline, only ONE cash alert must send for that fare observation
+    -- not two -- since both triggers share the same dedup key."""
+    config = make_config()
+    award = make_award()
+    state = InMemoryStateStore()
+    notifier = FakeNotifier()
+    heartbeat = FakeHeartbeat()
+
+    # Seed a baseline at $300 (above the $200 ceiling -- the seed itself
+    # must not trigger the ceiling).
+    run(
+        config, cash_provider=FakeCashFareProvider([[make_fare(price_usd=300.0)]]),
+        seats_client=FakeSeatsAeroClient([award]), state=state, notifier=notifier, heartbeat=heartbeat,
+    )
+    assert notifier.cash_sent == []
+    _force_baseline_stale(state, "IAD", "FCO", "business", award.date)
+
+    # $150 is BOTH a 50% drop from the $300 baseline (clears min_drop_pct)
+    # AND under the $200 absolute ceiling -- must produce exactly one alert.
+    run(
+        config, cash_provider=FakeCashFareProvider([[make_fare(price_usd=150.0)]]),
+        seats_client=FakeSeatsAeroClient([award]), state=state, notifier=notifier, heartbeat=heartbeat,
+    )
+
+    assert len(notifier.cash_sent) == 1
+    _, verdict_sent, _ = notifier.cash_sent[0]
+    assert verdict_sent.reason == "possible mistake fare (absolute ceiling)"  # ceiling took priority
+
+
+# --- observability: log which programs actually appear in real Cached
+# Search results, even when later rejected/deduped/capped ---
+
+
+def test_poll_route_logs_programs_seen_in_cached_search_results(caplog):
+    config = make_config()
+    route = config.routes[0]
+    awards = [make_award(program="aeroplan"), make_award(program="united", availability_id="united-iad-fco-2026-05-15", date=datetime.date(2026, 5, 15))]
+
+    with caplog.at_level(logging.INFO, logger="poller"):
+        from src.poller import poll_route
+
+        poll_route(
+            FakeSeatsAeroClient(awards), config.origins, route, config, InMemoryStateStore(), FakeNotifier(),
+            cash_provider=FakeCashFareProvider(),
+        )
+
+    summary = next(r.getMessage() for r in caplog.records if "Cached Search hit" in r.getMessage())
+    assert "aeroplan" in summary
+    assert "united" in summary
+
+
+def test_poll_route_logs_programs_seen_even_when_ineligible_and_rejected(caplog):
+    """The observability log must show EVERY program seen, not just the ones
+    that pass eligible_programs -- so an owner can see a program seats.aero
+    tracks that isn't on the eligible list at all, not just measure hits
+    among already-eligible ones."""
+    config = dataclasses.replace(make_config(), eligible_programs=["united"])  # aeroplan excluded
+    route = config.routes[0]
+    award = make_award(program="aeroplan")
+
+    with caplog.at_level(logging.INFO, logger="poller"):
+        from src.poller import poll_route
+
+        poll_route(
+            FakeSeatsAeroClient([award]), config.origins, route, config, InMemoryStateStore(), FakeNotifier(),
+            cash_provider=FakeCashFareProvider(),
+        )
+
+    summary = next(r.getMessage() for r in caplog.records if "Cached Search hit" in r.getMessage())
+    assert "aeroplan" in summary  # logged even though it was then rejected by eligible_programs
+
+
 class RaisingCashFareProvider:
     def search(self, *args, **kwargs):
         raise RuntimeError("SerpApi exploded")
@@ -681,7 +819,7 @@ def test_poller_skips_alert_when_real_taxes_fail_recheck(monkeypatch):
     import src.poller as poller_module
     from src.valuation import Verdict
 
-    def fake_is_high_value(award, config, wanted_cabins, comparable_cash_usd=None, taxes_usd=None):
+    def fake_is_high_value(award, config, wanted_cabins, comparable_cash_usd=None, taxes_usd=None, require_cash_comparison=False):
         if taxes_usd and taxes_usd > 0:
             return Verdict(False, "real taxes push trip value below floor", "")
         return Verdict(True, "optimistic estimate", "estimate")
@@ -846,6 +984,151 @@ def test_run_raises_clear_error_when_table_name_env_vars_missing(monkeypatch):
     config = make_config()
     with pytest.raises(RuntimeError, match="ALERTS_TABLE_NAME"):
         run(config, cash_provider=FakeCashFareProvider(), seats_client=FakeSeatsAeroClient([]), notifier=FakeNotifier(), heartbeat=FakeHeartbeat())
+
+
+# --- eligible_programs prefilter, per-route origins override, require_cash_comparison ---
+
+
+def test_poller_skips_ineligible_program_before_any_provider_call():
+    """eligible_programs must reject a candidate BEFORE a cash lookup or Get
+    Trips call is ever spent on it -- assert call counts, not just the
+    outcome, since a version that filtered too late (e.g. after the cash
+    lookup) would still produce alerts_sent == 0 but waste real provider
+    calls in production."""
+    config = dataclasses.replace(make_config(), eligible_programs=["united", "delta"])
+    award = make_award(program="aeroplan")  # not in eligible_programs
+    seats_client = FakeSeatsAeroClient([award])
+    cash_provider = FakeCashFareProvider([[make_fare(price_usd=5900.0)]])
+    state = InMemoryStateStore()
+    notifier = FakeNotifier()
+    heartbeat = FakeHeartbeat()
+
+    alerts_sent = run(
+        config, cash_provider=cash_provider, seats_client=seats_client, state=state, notifier=notifier,
+        heartbeat=heartbeat,
+    )
+
+    assert alerts_sent == 0
+    assert notifier.sent == []
+    assert cash_provider.calls == []  # no cash lookup was ever attempted
+    assert seats_client.get_trips_calls == []  # no Get Trips call was ever attempted
+
+
+def test_poller_fires_eligible_program_when_eligible_programs_set():
+    config = dataclasses.replace(make_config(), eligible_programs=["united", "aeroplan"])
+    award = make_award(program="aeroplan")  # in eligible_programs
+    seats_client = FakeSeatsAeroClient([award])
+    state = InMemoryStateStore()
+    notifier = FakeNotifier()
+    heartbeat = FakeHeartbeat()
+
+    alerts_sent = run(
+        config, cash_provider=FakeCashFareProvider(), seats_client=seats_client, state=state, notifier=notifier,
+        heartbeat=heartbeat,
+    )
+
+    assert alerts_sent == 1
+
+
+def test_poller_uses_route_origins_override_not_top_level():
+    """A route with its own `origins` override must be queried using THAT
+    origin list, not the top-level config.origins -- see RouteConfig.origins
+    and run()'s per-route resolution."""
+    config = make_config()
+    overridden_route = dataclasses.replace(config.routes[0], origins=["BWI"])
+    config = dataclasses.replace(config, routes=[overridden_route])
+    award = make_award(origin="BWI")
+    seats_client = FakeSeatsAeroClient([award])
+    state = InMemoryStateStore()
+    notifier = FakeNotifier()
+    heartbeat = FakeHeartbeat()
+
+    alerts_sent = run(
+        config, cash_provider=FakeCashFareProvider(), seats_client=seats_client, state=state, notifier=notifier,
+        heartbeat=heartbeat,
+    )
+
+    assert seats_client.cached_search_origins == ["BWI"]  # route override used, not config.origins ("IAD")
+    assert alerts_sent == 1
+
+
+def test_poller_route_without_origins_override_falls_back_to_top_level():
+    config = make_config()  # config.routes[0].origins is None -> falls back to config.origins == ["IAD"]
+    award = make_award()  # origin="IAD"
+    seats_client = FakeSeatsAeroClient([award])
+    state = InMemoryStateStore()
+    notifier = FakeNotifier()
+    heartbeat = FakeHeartbeat()
+
+    run(config, cash_provider=FakeCashFareProvider(), seats_client=seats_client, state=state, notifier=notifier, heartbeat=heartbeat)
+
+    assert seats_client.cached_search_origins == ["IAD"]
+
+
+def test_poller_require_cash_comparison_true_skips_when_no_cash_data_at_all():
+    """Contrast with test_poller_skips_confirm_and_uses_none_when_no_cash_provider_data_at_all
+    (require_cash_comparison defaults False there -> fires on cabin-match-alone):
+    with require_cash_comparison=True on the route, the exact same
+    no-cash-data situation must skip instead."""
+    config = make_config()
+    gated_route = dataclasses.replace(config.routes[0], require_cash_comparison=True)
+    config = dataclasses.replace(config, routes=[gated_route])
+    award = make_award()
+    seats_client = FakeSeatsAeroClient([award])
+    cash_provider = FakeCashFareProvider()  # always returns [] -- no cash data anywhere
+    state = InMemoryStateStore()
+    notifier = FakeNotifier()
+    heartbeat = FakeHeartbeat()
+
+    alerts_sent = run(
+        config, cash_provider=cash_provider, seats_client=seats_client, state=state, notifier=notifier,
+        heartbeat=heartbeat,
+    )
+
+    assert alerts_sent == 0
+    assert notifier.sent == []
+
+
+def test_poller_require_cash_comparison_false_still_fires_without_cash_data():
+    """The default (require_cash_comparison unset -> False) must keep
+    preserving the resilient v1.0-style fallback exactly as before -- this is
+    the same scenario as the test above with the gate off."""
+    config = make_config()
+    assert config.routes[0].require_cash_comparison is False
+    award = make_award()
+    seats_client = FakeSeatsAeroClient([award])
+    state = InMemoryStateStore()
+    notifier = FakeNotifier()
+    heartbeat = FakeHeartbeat()
+
+    alerts_sent = run(
+        config, cash_provider=FakeCashFareProvider(), seats_client=seats_client, state=state, notifier=notifier,
+        heartbeat=heartbeat,
+    )
+
+    assert alerts_sent == 1
+
+
+def test_poller_require_cash_comparison_true_still_fires_when_cash_data_clears_gate():
+    """require_cash_comparison only changes the "no cash data at all" branch
+    -- once real cash data resolves and clears the CPP gate, the route must
+    still fire normally."""
+    config = make_config()
+    gated_route = dataclasses.replace(config.routes[0], require_cash_comparison=True)
+    config = dataclasses.replace(config, routes=[gated_route])
+    award = make_award()
+    seats_client = FakeSeatsAeroClient([award])
+    cash_provider = FakeCashFareProvider([[make_fare(price_usd=5900.0)], [make_fare(price_usd=5900.0)]])
+    state = InMemoryStateStore()
+    notifier = FakeNotifier()
+    heartbeat = FakeHeartbeat()
+
+    alerts_sent = run(
+        config, cash_provider=cash_provider, seats_client=seats_client, state=state, notifier=notifier,
+        heartbeat=heartbeat,
+    )
+
+    assert alerts_sent == 1
 
 
 def test_run_does_not_close_an_injected_notifier():

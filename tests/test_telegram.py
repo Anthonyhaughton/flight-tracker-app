@@ -116,6 +116,15 @@ def test_format_cash_alert_omits_link_line_when_absent():
     assert "Book flight" not in message
 
 
+def test_format_cash_alert_handles_none_baseline():
+    # The absolute mistake-fare-ceiling trigger can fire before any baseline
+    # exists -- must format cleanly (not crash on None.ema_usd).
+    ceiling_verdict = Verdict(fire=True, reason="possible mistake fare (absolute ceiling)", headline="$150 one-way")
+    message = format_cash_alert(SAMPLE_FARE, ceiling_verdict, None)
+    assert "4,500" in message
+    assert "baseline" not in message.lower()
+
+
 @respx.mock
 def test_telegram_send_cash_alert_formats_and_sends():
     route = respx.post("https://api.telegram.org/bottest-token/sendMessage").mock(
