@@ -59,13 +59,12 @@ still warm) was explicitly cancelled mid-session before it started — never exe
 this whole measurement predates group-winner selection, treat it as a useful pre-grouping
 data point, not the current steady-state baseline — see "Next concrete steps" below.
 
-**BWI's exclusion from `DC → Europe (broad)`'s origins — still the right call, not
-re-confirmed against the current scope.** The original removal (see `watchlist.yaml`'s own
-comment) was justified against an economy-only cost projection; business/first have since
-tripled per-route cabin fan-out, so BWI's real incremental cost if ever re-added is higher
-than that original estimate, not lower. The decision itself likely still holds (if anything,
-more strongly) — but nobody has explicitly re-run that reasoning against the current 3-cabin
-scope. Open, not urgent, not blocking.
+**BWI's exclusion from `DC → Europe (broad)`'s origins is now a permanent decision, resolved
+this session — not an open item.** The original removal (see `watchlist.yaml`'s own comment)
+was justified against an economy-only cost projection; business/first have since tripled
+per-route cabin fan-out, which only strengthens the case for staying IAD-only rather than
+weakening it. `watchlist.yaml`'s comment and `tests/test_config.py`'s real-watchlist
+regression test were both updated to reflect this as permanent, not deferred.
 
 **Both EventBridge schedules exist in real AWS and remain confirmed `DISABLED`** —
 `award-cached-poll` and `digest-weekly` — unchanged this session, verified via `terraform
@@ -74,17 +73,12 @@ concrete steps" below is confirmed clean** — v1.2.1 hasn't even been applied y
 
 ## Next concrete steps, in order
 
-1. **Confirm BWI's status.** Re-run the origins-inclusion cost reasoning against the CURRENT
-   3-cabin (economy + business + first) scope, not the economy-only numbers the original
-   deferral was based on. Likely conclusion: still exclude it, now with a stronger/updated
-   justification — but don't assume that without redoing the math against real current
-   fan-out.
-2. **Confirm/apply the `transfer_bonus_pct.virginatlantic` update.** It's live in
+1. **Confirm/apply the `transfer_bonus_pct.virginatlantic` update.** It's live in
    `watchlist.yaml` (0.3, expires 2026-07-31) but not yet in the deployed Lambda — it needs a
    zip rebuild + real deploy (alongside everything else in this session, since all of it ships
    in the same package) to actually take effect in production, and a reminder to revert it to
    0.0 after 2026-07-31 if the promo isn't renewed.
-3. **Re-run Run 1/Run 2 (steady-state cost measurement) now that grouping is built.** The old
+2. **Re-run Run 1/Run 2 (steady-state cost measurement) now that grouping is built.** The old
    Run 1 numbers (620.3s, 171 SerpApi calls) predate group-winner selection and are expected to
    overstate real cost going forward — Run 1's own log showed the ENTIRE alert cap consumed by
    one repeating flat-rate chart, exactly the case grouping now collapses to one winner before
@@ -92,13 +86,13 @@ concrete steps" below is confirmed clean** — v1.2.1 hasn't even been applied y
    most buckets still warm) pair, with grouping active, is what actually answers "what does
    real steady-state polling cost now" — the old numbers shouldn't be trusted for that
    question anymore.
-4. **THEN reconsider `max_alerts_per_run` (currently 8) with accurate numbers.** Only after
-   step 3's fresh measurement — tuning the cap against pre-grouping numbers (where one program
+3. **THEN reconsider `max_alerts_per_run` (currently 8) with accurate numbers.** Only after
+   step 2's fresh measurement — tuning the cap against pre-grouping numbers (where one program
    could exhaust it alone) would be tuning against a problem grouping already fixes, not the
    real remaining shape of the data.
-5. **Real-time schedule (`award-cached-poll`) stays `DISABLED` until 1-4 above are all
+4. **Real-time schedule (`award-cached-poll`) stays `DISABLED` until 1-3 above are all
    confirmed clean.** This is in addition to, not instead of, the still-pending heartbeat fix
-   deploy: even once BWI/transfer-bonus/cost/cap are all settled, `terraform apply` +
+   deploy: even once transfer-bonus/cost/cap are all settled, `terraform apply` +
    `terraform plan` review is still a separate, deliberate step, and enabling either schedule
    is its own later decision after that (see `aws-serverless-deploy`'s two-phase-apply
    discipline).

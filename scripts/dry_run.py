@@ -48,26 +48,28 @@ as a pre-flight estimate before any real call is made:
   - seats.aero Cached Search: EXACTLY len(origins) x len(destinations) calls
     (cached_search() issues one HTTP GET per destination internally, once
     per origin) -- deterministic, not an estimate.
-  - seats.aero Get Trips: 0 to --max-alerts calls (one per GROUP WINNER --
+  - seats.aero Get Trips: 0 to (--economy-cap + --premium-cap) calls (one per GROUP WINNER --
     see select_group_winners() -- that isn't a dedup duplicate and isn't
     cap-blocked; near-duplicate dates of the same deal in the same calendar
     month collapse to a single winner before Get Trips is ever spent, so
     this is bounded by distinct deals, not distinct dates).
   - SerpApi weekly-baseline lookups: one real call per distinct
     (route, cabin, ISO-week) bucket among prefilter-passing candidates that
-    isn't already cached -- NOT bounded by --max-alerts (matches
+    isn't already cached -- NOT bounded by the reserved caps (matches
     production: the cap only blocks Get Trips/sends, not the cheap
     first-pass baseline lookup) -- genuinely unpredictable before running
     for a wide route, since it depends on how much real award space exists
     across the whole window.
-  - SerpApi exact-date confirms: 0 to --max-alerts calls (one per candidate
+  - SerpApi exact-date confirms: 0 to (--economy-cap + --premium-cap) calls (one per candidate
     that reaches Get Trips).
   - The mistake-fare-ceiling trigger makes NO separate SerpApi call of its
     own -- it's evaluated against the SAME weekly-baseline call's result as
     the relative-drop trigger, so it costs nothing incremental.
 
-Unlike an earlier version, the send cap (--max-alerts, defaults to the REAL
-config.alerts.max_alerts_per_run) no longer stops the script from evaluating
+Unlike an earlier version, the send cap (--economy-cap/--premium-cap,
+defaulting to the REAL config.alerts.economy_reserved_slots/
+premium_reserved_slots -- a hard-partitioned reserved split, not a shared
+pool, see AlertConfig's own comment) no longer stops the script from evaluating
 further candidates once hit -- it now CONTINUES through the cheap
 first-pass gate (mirroring poll_route()'s real continue-not-break behavior)
 so skipped_capped accurately counts every candidate that genuinely matched
@@ -106,7 +108,7 @@ src/digest.py's build_weekly_digest() -- the SAME function src/poller.py's
 run_digest() (the Lambda digest path) calls -- for the exact same
 avoiding-duplicate-implementations reason this script already calls
 classify_candidate()/finish_award_candidate() for the real-time path
-above. --max-alerts doesn't
+above. --economy-cap/--premium-cap don't
 apply in this mode (there's no per-run send cap on a digest -- it ranks and
 reports everything, see src/digest.py). --origins/--destinations DO apply,
 applied UNIFORMLY to every active route the digest walks (there's no single
@@ -121,7 +123,7 @@ Not wired into the poller or scheduler. Run manually:
 
     python scripts/dry_run.py --route "DC → Italy"
     python scripts/dry_run.py --route "DC → Europe (broad)"
-    python scripts/dry_run.py --route "DC → Europe (broad)" --max-alerts 3
+    python scripts/dry_run.py --route "DC → Europe (broad)" --economy-cap 3 --premium-cap 1
     python scripts/dry_run.py --route "DC → Europe (broad)" --origins IAD --destinations LHR --cpp-floor 2.0 --min-trip-value 250
     python scripts/dry_run.py --mode digest
     python scripts/dry_run.py --mode digest --origins IAD --destinations LHR,BCN
@@ -287,10 +289,16 @@ def main() -> int:
         "not accepted for --mode digest (which always covers every active route).",
     )
     parser.add_argument(
-        "--max-alerts", type=int, default=None,
-        help="Send cap for this run. Defaults to the REAL config.alerts.max_alerts_per_run "
-        "(so this script can validate whether that cap is sufficient for a route this size) "
-        "-- pass a smaller number to be more conservative on a first-ever test of a new route.",
+        "--economy-cap", type=int, default=None,
+        help="Reserved economy send-cap slots for this run. Defaults to the REAL "
+        "config.alerts.economy_reserved_slots. Economy and premium (business/first) are hard-"
+        "partitioned, NOT a shared pool -- see AlertConfig.economy_reserved_slots' own comment.",
+    )
+    parser.add_argument(
+        "--premium-cap", type=int, default=None,
+        help="Reserved business/first send-cap slots for this run. Defaults to the REAL "
+        "config.alerts.premium_reserved_slots. Pass a smaller number (with --economy-cap) to be "
+        "more conservative on a first-ever test of a new route.",
     )
     parser.add_argument(
         "--origins", type=str, default=None,
@@ -432,25 +440,28 @@ def main() -> int:
     cabins = route.cabins
     wanted_cabins = set(cabins)
     start, end = route.date_window.to_dates()
-    max_alerts = args.max_alerts if args.max_alerts is not None else config.alerts.max_alerts_per_run
+    economy_cap = args.economy_cap if args.economy_cap is not None else config.alerts.economy_reserved_slots
+    premium_cap = args.premium_cap if args.premium_cap is not None else config.alerts.premium_reserved_slots
 
     est_cached_search_calls = len(origins) * len(destinations)
     logger.info(
         "Route: %r | origins=%s destinations=%s cabins=%s dates=%s..%s | "
-        "eligible_programs=%s | send cap=%d",
+        "eligible_programs=%s | reserved send cap=%s economy / %s premium (business/first)",
         route.name, origins, destinations, cabins, start.isoformat(), end.isoformat(),
-        config.eligible_programs, max_alerts,
+        config.eligible_programs, economy_cap, premium_cap,
     )
     logger.info(
         "PRE-FLIGHT: this run will issue EXACTLY %d seats.aero Cached Search call(s) "
-        "(%d origin(s) x %d destination(s)), plus up to %d Get Trips call(s) (bounded by the send "
-        "cap). SerpApi weekly-baseline call count is NOT bounded by the send cap (matches production) "
-        "and cannot be predicted exactly before running -- it depends on how many distinct "
+        "(%d origin(s) x %d destination(s)), plus up to %s Get Trips call(s) (bounded by the reserved "
+        "send caps -- economy and premium are hard-partitioned, not a shared pool, see AlertConfig's "
+        "own comment). SerpApi weekly-baseline call count is NOT bounded by either cap (matches "
+        "production) and cannot be predicted exactly before running -- it depends on how many distinct "
         "(route, cabin, ISO-week) buckets have real eligible award space across the whole window. "
         "Note: threshold overrides (--cpp-floor/--min-trip-value) do NOT change this estimate -- the "
         "baseline lookup happens before the value gate is evaluated, so a looser threshold doesn't "
         "cost more SerpApi calls, only changes how many candidates pass afterward.",
-        est_cached_search_calls, len(origins), len(destinations), max_alerts,
+        est_cached_search_calls, len(origins), len(destinations),
+        (economy_cap + premium_cap) if economy_cap is not None and premium_cap is not None else "unbounded",
     )
 
     # The SAME PollStats production's poll_route() uses -- no parallel set
@@ -657,7 +668,7 @@ def main() -> int:
                 try:
                     classify_result = classify_candidate(
                         award, route, config, state, notifier, cash_update,
-                        max_alerts_per_run=max_alerts, stats=stats,
+                        economy_reserved_slots=economy_cap, premium_reserved_slots=premium_cap, stats=stats,
                     )
                 except DiscordError as exc:
                     logger.error("DISCORD SEND FAILED for %s: %s", award.availability_id, exc)
@@ -707,7 +718,7 @@ def main() -> int:
             try:
                 award_outcome = finish_award_candidate(
                     first_pass, other_dates, config, state, notifier, fetch_trip,
-                    max_alerts_per_run=max_alerts, stats=stats,
+                    economy_reserved_slots=economy_cap, premium_reserved_slots=premium_cap, stats=stats,
                 )
             except DiscordError as exc:
                 logger.error("DISCORD SEND FAILED for %s: %s", award.availability_id, exc)
@@ -737,11 +748,13 @@ def main() -> int:
 
         logger.info(
             "Done. route=%r %d candidate(s) seen across program(s) %s. %d sent (%d award, %d cash-drop, "
-            "%d mistake-fare-ceiling), %d skipped-as-duplicate, %d skipped-capped (genuinely matched, "
+            "%d mistake-fare-ceiling) -- %d economy / %d premium (business/first) of the reserved split, "
+            "%d skipped-as-duplicate, %d skipped-capped (genuinely matched, "
             "lost the send-cap race), %d grouped-out (lost to a same-route/cabin/program/month "
             "candidate), %d skipped-timeout (transient, not a real rejection), %d skipped-other.",
             route.name, stats.candidates_evaluated, sorted(programs_seen_overall),
             stats.alerts_sent, stats.alerts_sent - cash_drop_sent - ceiling_sent, cash_drop_sent, ceiling_sent,
+            stats.alerts_sent_economy, stats.alerts_sent_premium,
             stats.skipped_duplicate, stats.skipped_capped, stats.skipped_grouped_out, skipped_timeout,
             stats.skipped_other,
         )
@@ -764,9 +777,10 @@ def main() -> int:
             logger.info("No candidate had both a resolved cash price and known taxes -- no value distribution to report.")
         if stats.skipped_capped > 0:
             logger.info(
-                "%d candidate(s) genuinely cleared the first-pass gate but lost the send-cap (%d) race this run -- "
-                "the cap IS limiting real coverage for this route at this cap value.",
-                stats.skipped_capped, max_alerts,
+                "%d candidate(s) genuinely cleared the first-pass gate but lost the reserved-slot send-cap "
+                "race this run (economy cap=%s, premium cap=%s) -- the cap IS limiting real coverage for "
+                "this route at these cap values.",
+                stats.skipped_capped, economy_cap, premium_cap,
             )
         if stats.alerts_sent > 0:
             logger.info("Check Discord -- %d embed(s) should have landed in the channel.", stats.alerts_sent)

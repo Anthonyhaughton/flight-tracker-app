@@ -137,6 +137,7 @@ from src.valuation import (
     is_cash_below_mistake_fare_ceiling,
     is_cash_price_drop,
     is_high_value,
+    is_premium_cabin,
     passes_award_prefilter,
     select_group_winners,
 )
@@ -159,15 +160,22 @@ class Heartbeat(Protocol):
 @dataclass
 class PollStats:
     """Accumulated across every route/origin in a single run() invocation --
-    passed by reference into poll_route() so the cap (config.alerts.
-    max_alerts_per_run) is enforced across the whole run, not per-route.
+    passed by reference into poll_route() so the reserved-slot cap
+    (config.alerts.economy_reserved_slots/premium_reserved_slots) is
+    enforced across the whole run, not per-route.
 
-    alerts_sent is the TOTAL of both alert kinds (award + cash) and is what
-    max_alerts_per_run gates -- a route producing many cash-drop bucket
-    crossings is exactly the same kind of flood risk as many award
-    candidates, so they share one budget. cash_alerts_sent is a subset of
-    alerts_sent, tracked separately purely so the summary log can show the
-    award/cash split.
+    alerts_sent is the TOTAL of both alert kinds (award + cash), kept for
+    logging/backward-compat -- it is NOT itself what's gated anymore.
+    alerts_sent_economy/alerts_sent_premium are the two HARD-PARTITIONED
+    sub-counts the reserved cap actually checks (see is_premium_cabin and
+    the cap checks in classify_candidate()/finish_award_candidate() below):
+    an economy candidate only ever competes against alerts_sent_economy and
+    economy_reserved_slots, a business/first candidate only ever against
+    alerts_sent_premium and premium_reserved_slots -- neither tier can
+    borrow the other's unused capacity. Both are always a subset of
+    alerts_sent (alerts_sent_economy + alerts_sent_premium == alerts_sent),
+    same relationship cash_alerts_sent already has to alerts_sent, tracked
+    separately purely so the summary log can show every split at once.
 
     skipped_grouped_out is DISTINCT from skipped_capped and skipped_duplicate:
     it counts a candidate that cleared the first-pass gate but lost to a
@@ -182,10 +190,41 @@ class PollStats:
     candidates_evaluated: int = 0
     alerts_sent: int = 0
     cash_alerts_sent: int = 0
+    alerts_sent_economy: int = 0
+    alerts_sent_premium: int = 0
     skipped_duplicate: int = 0
     skipped_capped: int = 0
     skipped_other: int = 0
     skipped_grouped_out: int = 0
+
+    def record_send(self, cabin: str, *, is_cash: bool = False) -> None:
+        """The ONE place a send is counted, for both alert kinds -- keeps
+        alerts_sent/alerts_sent_economy/alerts_sent_premium/cash_alerts_sent
+        from drifting out of sync with each other across the two call
+        sites (the cash trigger in classify_candidate(), the award send in
+        finish_award_candidate())."""
+        self.alerts_sent += 1
+        if is_cash:
+            self.cash_alerts_sent += 1
+        if is_premium_cabin(cabin):
+            self.alerts_sent_premium += 1
+        else:
+            self.alerts_sent_economy += 1
+
+
+def _reserved_slot_available(
+    cabin: str, stats: PollStats, *, economy_reserved_slots: int | None, premium_reserved_slots: int | None,
+) -> bool:
+    """True if `cabin`'s own reserved slice of this run's alert budget still
+    has room. Economy and business/first are hard-partitioned, NOT a shared
+    pool -- see AlertConfig.economy_reserved_slots/premium_reserved_slots'
+    own comment for the real measurement that motivated this (a shared pool
+    let business/first structurally crowd out economy every time). None
+    means that tier is unbounded, matching the old max_alerts_per_run=None
+    ("no cap") convention this replaces."""
+    if is_premium_cabin(cabin):
+        return premium_reserved_slots is None or stats.alerts_sent_premium < premium_reserved_slots
+    return economy_reserved_slots is None or stats.alerts_sent_economy < economy_reserved_slots
 
 
 def _require_env(var_name: str, purpose: str) -> str:
@@ -350,7 +389,8 @@ def classify_candidate(
     notifier: Notifier,
     cash_update: CashBaselineUpdate | None,
     *,
-    max_alerts_per_run: int | None,
+    economy_reserved_slots: int | None,
+    premium_reserved_slots: int | None,
     stats: PollStats,
 ) -> ClassifyResult:
     """Phase 1 of the shared per-candidate decision pipeline (immediate, no
@@ -425,11 +465,15 @@ def classify_candidate(
                 cash_outcome = CashOutcome(
                     outcome="duplicate", fare=cash_update.current_fare, verdict=cash_verdict, key=c_key,
                 )
-            elif max_alerts_per_run is not None and stats.alerts_sent >= max_alerts_per_run:
+            elif not _reserved_slot_available(
+                cash_update.current_fare.cabin, stats,
+                economy_reserved_slots=economy_reserved_slots, premium_reserved_slots=premium_reserved_slots,
+            ):
                 stats.skipped_capped += 1
                 logger.info(
-                    "cash drop %s matched but capped (max_alerts_per_run=%d reached this run), skipping send",
-                    c_key, max_alerts_per_run,
+                    "cash drop %s (%s) matched but capped (reserved slots for this cabin tier reached this run), "
+                    "skipping send",
+                    c_key, cash_update.current_fare.cabin,
                 )
                 cash_outcome = CashOutcome(
                     outcome="capped", fare=cash_update.current_fare, verdict=cash_verdict, key=c_key,
@@ -438,8 +482,7 @@ def classify_candidate(
             else:
                 notifier.send_cash_alert(cash_update.current_fare, cash_verdict, cash_update.previous)
                 state.record_alert(c_key, ttl_seconds=config.alerts.dedup_ttl_days * 86400)
-                stats.alerts_sent += 1
-                stats.cash_alerts_sent += 1
+                stats.record_send(cash_update.current_fare.cabin, is_cash=True)
                 cash_outcome = CashOutcome(
                     outcome="sent", fare=cash_update.current_fare, verdict=cash_verdict, key=c_key,
                 )
@@ -471,7 +514,8 @@ def finish_award_candidate(
     notifier: Notifier,
     fetch_trip: Callable[[AwardAvailability, float], TripFetchResult],
     *,
-    max_alerts_per_run: int | None,
+    economy_reserved_slots: int | None,
+    premium_reserved_slots: int | None,
     stats: PollStats,
 ) -> AwardOutcome:
     """Phase 2 of the shared per-candidate decision pipeline: dedup -> cap
@@ -510,16 +554,24 @@ def finish_award_candidate(
     # deals within a single run), before Get Trips (so a capped candidate
     # doesn't burn seats.aero quota on a call we already know won't lead to
     # a send). Reported, not dropped silently -- it genuinely matched, it
-    # just lost the race for this run's budget.
-    if max_alerts_per_run is not None and stats.alerts_sent >= max_alerts_per_run:
+    # just lost the race for this run's budget. Reserved-slot, not shared-
+    # pool: an economy candidate only ever competes against
+    # economy_reserved_slots, business/first only ever against
+    # premium_reserved_slots -- see is_premium_cabin and
+    # _reserved_slot_available's own comment for why.
+    if not _reserved_slot_available(
+        award.cabin, stats,
+        economy_reserved_slots=economy_reserved_slots, premium_reserved_slots=premium_reserved_slots,
+    ):
         stats.skipped_capped += 1
+        tier = "premium (business/first)" if is_premium_cabin(award.cabin) else "economy"
         logger.info(
-            "%s matched but capped (max_alerts_per_run=%d reached this run), skipping send",
-            award.availability_id, max_alerts_per_run,
+            "%s (%s) matched but capped (%s reserved slots reached this run), skipping send",
+            award.availability_id, award.cabin, tier,
         )
         return AwardOutcome(
             outcome="skipped",
-            reason=f"send cap ({max_alerts_per_run}) reached but candidate genuinely matched",
+            reason=f"{tier} reserved slot cap reached but candidate genuinely matched",
             key=key,
             already_logged=True,
         )
@@ -574,7 +626,7 @@ def finish_award_candidate(
         group_other_dates=other_dates,
     )
     state.record_alert(key, ttl_seconds=config.alerts.dedup_ttl_days * 86400)
-    stats.alerts_sent += 1
+    stats.record_send(award.cabin)
     return AwardOutcome(outcome="sent", reason=real_verdict.reason, key=key, trip=trip)
 
 
@@ -587,7 +639,8 @@ def poll_route(
     notifier: Notifier,
     *,
     cash_provider: CashFareProvider | None = None,
-    max_alerts_per_run: int | None = None,
+    economy_reserved_slots: int | None = None,
+    premium_reserved_slots: int | None = None,
     stats: PollStats | None = None,
 ) -> PollStats:
     start, end = route.date_window.to_dates()
@@ -693,7 +746,8 @@ def poll_route(
             classify_results.append(
                 classify_candidate(
                     award, route, config, state, notifier, cash_update,
-                    max_alerts_per_run=max_alerts_per_run, stats=stats,
+                    economy_reserved_slots=economy_reserved_slots, premium_reserved_slots=premium_reserved_slots,
+                    stats=stats,
                 )
             )
 
@@ -723,7 +777,8 @@ def poll_route(
     for first_pass, other_dates in group_winners:
         finish_award_candidate(
             first_pass, other_dates, config, state, notifier, fetch_trip,
-            max_alerts_per_run=max_alerts_per_run, stats=stats,
+            economy_reserved_slots=economy_reserved_slots, premium_reserved_slots=premium_reserved_slots,
+            stats=stats,
         )
 
     return stats
@@ -770,7 +825,8 @@ def run(
                 state,
                 notifier,
                 cash_provider=cash_provider,
-                max_alerts_per_run=config.alerts.max_alerts_per_run,
+                economy_reserved_slots=config.alerts.economy_reserved_slots,
+                premium_reserved_slots=config.alerts.premium_reserved_slots,
                 stats=stats,
             )
     except SeatsAeroAuthError:
@@ -792,9 +848,11 @@ def run(
     # factor on a given run.
     heartbeat.emit()
     logger.info(
-        "poll complete: %d candidate(s) evaluated, %d alert(s) sent (%d cash), %d skipped as duplicate, "
-        "%d skipped (cap reached), %d grouped out (lost to a same-route/cabin/program/month candidate)",
+        "poll complete: %d candidate(s) evaluated, %d alert(s) sent (%d cash), %d economy / %d premium "
+        "(business/first) of the reserved split, %d skipped as duplicate, %d skipped (cap reached), "
+        "%d grouped out (lost to a same-route/cabin/program/month candidate)",
         stats.candidates_evaluated, stats.alerts_sent, stats.cash_alerts_sent,
+        stats.alerts_sent_economy, stats.alerts_sent_premium,
         stats.skipped_duplicate, stats.skipped_capped, stats.skipped_grouped_out,
     )
     return stats.alerts_sent

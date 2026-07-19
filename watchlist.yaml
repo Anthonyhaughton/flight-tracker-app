@@ -84,18 +84,19 @@ routes:
       end_offset: 361      # -> 2027-07-14 relative to 2026-07-18
   - name: "DC → Europe (broad)"
     active: true
-    # No origins override -- falls back to the top-level [IAD] above. BWI
-    # was removed from here (previously origins: [IAD, BWI]) 2026-07-19: a
-    # pre-flight cost check ahead of the first real digest run found
-    # scripts/.dry_run_state.json holds ZERO cached baselines for
-    # BWI-anything -- BWI has never actually been queried by anything, ever.
-    # Adding it back in would make a run across all 8 destinations x ~18
-    # ISO-week buckets fully cache-cold for that origin, with SerpApi
-    # weekly-baseline cost potentially DOUBLING versus IAD alone (a real
-    # unknown, not a rounding error -- see SESSION_HANDOFF.md). Deferred, not
-    # abandoned: re-add once either a SerpApi tier upgrade affords the extra
-    # volume, or a dedicated, budget-scoped test run of BWI specifically has
-    # established its real density.
+    # IAD only -- BWI deliberately out of scope, not a cost-driven deferral.
+    # No origins override here -- falls back to the top-level [IAD] above.
+    # BWI was removed from here (previously origins: [IAD, BWI]) 2026-07-19
+    # and stays out permanently: a pre-flight cost check ahead of the first
+    # real digest run found scripts/.dry_run_state.json holds ZERO cached
+    # baselines for BWI-anything -- BWI has never actually been queried by
+    # anything, ever. Adding it back in would make a run across all 8
+    # destinations x ~18 ISO-week buckets fully cache-cold for that origin,
+    # with SerpApi weekly-baseline cost potentially DOUBLING versus IAD
+    # alone. Business/first were added alongside economy after this decision
+    # (tripling per-route cabin fan-out), which only strengthens the case for
+    # staying IAD-only -- BWI's real incremental cost today is higher than
+    # the original estimate, not lower.
     destinations: [LHR, CDG, AMS, FRA, ZRH, LIS, BCN, CPH]
     cabins: [economy, business, first]
     date_window:
@@ -213,14 +214,54 @@ cash:
 
 # --- polling cadence (minutes) ---
 schedule:
-  award_cached_minutes: 20
-  cash_baseline_minutes: 60
+  # 60 (previously 20). seats.aero's 1,000-call/day quota resets daily, not
+  # per-minute -- a real 2026-07-19 measurement found the 20-minute cadence's
+  # combined Cached Search + Get Trips cost (~17-18 calls/poll x 72 polls/day)
+  # threatens to exceed the daily quota on its own, before the cash side is
+  # even considered. Hourly (24 polls/day) gives comfortable headroom.
+  # NOTE: this value is config-as-code documentation of intended cadence --
+  # the REAL schedule interval is infra/variables.tf's
+  # award_poll_schedule_expression (still "rate(20 minutes)" as of this
+  # writing) via the EventBridge schedule in infra/schedule.tf. That
+  # Terraform variable has NOT been updated to match yet -- deliberately out
+  # of scope for this change (no Terraform/deploy touched), needs updating
+  # alongside the next real deploy.
+  award_cached_minutes: 60
+  # 10080 (7 days, previously 60 minutes). A real two-poll measurement
+  # (2026-07-19, ~41 minutes apart) confirmed SerpApi weekly-baseline cost
+  # collapses to near-zero once a bucket is warm within the freshness
+  # window -- 60 minutes meant most real-cadence polls paid a fresh refresh
+  # anyway once cadence moved to hourly (poll N+1 would already be outside a
+  # 60-minute window). 7 days keeps a bucket fresh across many consecutive
+  # hourly polls, since ISO-week-bucketed cash prices don't meaningfully
+  # change hour to hour -- see src/cash.py's get_or_refresh_baseline (the
+  # sole place this value is read, via config.schedule.cash_baseline_minutes)
+  # and .claude/skills/flight-cash-price-monitor.
+  cash_baseline_minutes: 10080
 
 # --- alerting ---
 alerts:
   dedup_ttl_days: 5                    # a vanished deal can re-alert after this
-  max_alerts_per_run: 8                # cap on NEW deals alerted in a single invocation
+  max_alerts_per_run: 8                # total NEW deals alerted in a single invocation -- reference/
+                                        # documentation only now (should equal the sum of the two
+                                        # reserved-slot fields below); NOT itself enforced, see those.
                                         # (independent of dedup_ttl_days -- see src/poller.py)
+
+  # Reserved, hard-partitioned slices of max_alerts_per_run -- NOT a shared
+  # pool. A real 2026-07-19 measurement (two consecutive live polls) found a
+  # shared pool let business/first structurally crowd out economy every
+  # time: 16 for 16 real sends across both polls were business/first, zero
+  # economy -- premium's bigger cash-vs-miles gap clears both the CPP floor
+  # and min_trip_value_usd more easily than economy ever will. Economy now
+  # gets a GUARANTEED share: an exhausted tier's unused slots are never
+  # borrowed by the other tier, in either direction -- see
+  # src/valuation.py's is_premium_cabin and src/poller.py's
+  # _reserved_slot_available. Applied identically to src/digest.py's top-5
+  # ranking (select_top_n_with_reserved_quota) -- there, economy_reserved_
+  # slots (6) exceeds the 5-slot list, so only premium_reserved_slots
+  # visibly binds.
+  economy_reserved_slots: 6
+  premium_reserved_slots: 2
 
 # --- notifications ---
 notifier: discord    # discord (default) or telegram -- swap without code changes

@@ -55,6 +55,18 @@ class Verdict:
     headline: str
 
 
+# Single source of truth for "which cabin tier is this" -- used by the
+# reserved-cap split (AlertConfig.economy_reserved_slots/
+# premium_reserved_slots) in both src/poller.py's real-time cap check and
+# src/digest.py's top-N ranking, so the two never drift on what counts as
+# "premium." See AlertConfig's own comment for why the split exists at all.
+PREMIUM_CABINS = frozenset({"business", "first"})
+
+
+def is_premium_cabin(cabin: str) -> bool:
+    return cabin in PREMIUM_CABINS
+
+
 def passes_award_prefilter(
     award: AwardAvailability,
     wanted_cabins: set[str],
@@ -160,6 +172,47 @@ def select_group_winners(candidates: list[_T]) -> list[tuple[_T, list]]:
         other_dates = sorted(c.award.date for c in group if c.award.date != winner.award.date)
         winners.append((winner, other_dates))
     return winners
+
+
+def select_top_n_with_reserved_quota(
+    candidates_sorted_desc: list[_T],
+    total_slots: int,
+    economy_reserved_slots: int | None,
+    premium_reserved_slots: int | None,
+) -> list[_T]:
+    """The digest's batch analogue of src/poller.py's per-candidate reserved-
+    cap check -- same AlertConfig numbers (economy_reserved_slots/
+    premium_reserved_slots), same is_premium_cabin() classification, same
+    no-backfill rule (an exhausted tier's unused slots are never borrowed by
+    the other), just applied as a one-shot selection over an already-ranked
+    list instead of an incremental counter check against streaming sends.
+    See AlertConfig's own comment for why the split exists and
+    src/digest.py's callers for how this composes with `total_slots` (5,
+    src/digest.py's TOP_N) -- economy_reserved_slots (6, the default)
+    exceeds a 5-slot list, so in practice this only ever visibly caps
+    premium's share of a top-5 list, not economy's.
+
+    `candidates_sorted_desc` must already be sorted best-first (by whatever
+    metric the caller ranks on) -- this function only decides ADMISSION,
+    never re-sorts. None for either reserved-slots argument means that tier
+    is unbounded, matching AlertConfig's None-means-unbounded convention
+    used elsewhere (e.g. eligible_programs)."""
+    economy_count = 0
+    premium_count = 0
+    selected: list[_T] = []
+    for c in candidates_sorted_desc:
+        if len(selected) >= total_slots:
+            break
+        if is_premium_cabin(c.award.cabin):
+            if premium_reserved_slots is not None and premium_count >= premium_reserved_slots:
+                continue
+            premium_count += 1
+        else:
+            if economy_reserved_slots is not None and economy_count >= economy_reserved_slots:
+                continue
+            economy_count += 1
+        selected.append(c)
+    return selected
 
 
 def is_high_value(

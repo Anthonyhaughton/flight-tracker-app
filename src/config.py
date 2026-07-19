@@ -95,12 +95,31 @@ class ScheduleConfig:
 @dataclass(frozen=True)
 class AlertConfig:
     dedup_ttl_days: int
-    # Caps NEW deals alerted in a single poller invocation. Independent of
-    # dedup (which only stops the SAME deal re-alerting on a LATER run) --
-    # this guards against a wide date window or a newly widened/added route
+    # Total NEW deals alerted in a single poller invocation -- kept as
+    # documentation/reference (should equal economy_reserved_slots +
+    # premium_reserved_slots below) but is NOT itself what's enforced; see
+    # those two fields for the real per-tier gating. Independent of dedup
+    # (which only stops the SAME deal re-alerting on a LATER run) -- this
+    # guards against a wide date window or a newly widened/added route
     # surfacing many qualifying candidates against an empty dedup table in
     # one run. See src/poller.py's run()/poll_route().
     max_alerts_per_run: int = 8
+    # Reserved, hard-partitioned slices of max_alerts_per_run -- NOT a shared
+    # pool. Real 2026-07-19 production-like measurements (two consecutive
+    # real polls) showed business/first structurally out-competing economy
+    # for a shared cap every time (16 for 16 real sends across both polls
+    # were business/first, zero economy), because a premium redemption's
+    # bigger cash-vs-miles gap clears both the CPP floor and
+    # min_trip_value_usd more easily than economy ever will -- see
+    # .claude/skills/deal-valuation. Economy gets a GUARANTEED share of the
+    # budget: an exhausted tier's unused slots are never borrowed by the
+    # other tier, in either direction -- see src/valuation.py's
+    # is_premium_cabin and src/poller.py's reserved-slot cap check. Applied
+    # identically to src/digest.py's top-5 ranking (there, premium is capped
+    # at premium_reserved_slots per list; economy is never actually bound by
+    # its own 6, since a top-5 list can't hold 6 anyway -- see digest.py).
+    economy_reserved_slots: int = 6
+    premium_reserved_slots: int = 2
 
 
 @dataclass(frozen=True)

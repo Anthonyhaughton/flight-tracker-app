@@ -14,7 +14,13 @@ wholesale-reuse case:
   "would this have cleared the real-time bar" without re-deriving that
   condition), `select_group_winners` (src/valuation.py -- the SAME per-
   (origin, destination, cabin, program, calendar month) winner-selection
-  the real-time path applies before its own alert cap, see below), and
+  the real-time path applies before its own alert cap, see below),
+  `select_top_n_with_reserved_quota` (src/valuation.py -- the SAME
+  economy_reserved_slots/premium_reserved_slots split and is_premium_cabin()
+  classification src/poller.py's real-time alert cap enforces, applied here
+  as a one-shot admission pass over each already-ranked top-5 list instead
+  of an incremental per-send counter check -- see AlertConfig's own
+  comment for why the split exists at all), and
   `get_or_refresh_baseline`/`confirm_exact_date_price` (src/cash.py -- the
   SAME two-stage cheap-estimate-then-real-confirm cash pricing the
   real-time path uses).
@@ -62,7 +68,13 @@ from src.config import RouteConfig, WatchlistConfig
 from src.providers.cash.base import CashFareProvider
 from src.providers.seats_aero import AwardAvailability, SeatsAeroClient, SeatsAeroRateLimitError
 from src.state import StateStore
-from src.valuation import compute_effective_cpp, is_high_value, passes_award_prefilter, select_group_winners
+from src.valuation import (
+    compute_effective_cpp,
+    is_high_value,
+    passes_award_prefilter,
+    select_group_winners,
+    select_top_n_with_reserved_quota,
+)
 
 logger = logging.getLogger("digest")
 
@@ -312,8 +324,24 @@ def build_weekly_digest(
     grouped_winners = [entry for entry, _ in select_group_winners(all_entries)]
     candidates_ranked = len(grouped_winners)
 
-    cash_rank = sorted(grouped_winners, key=lambda e: e.trip_value_usd, reverse=True)[:TOP_N]
-    cpp_rank = sorted(grouped_winners, key=lambda e: e.cpp, reverse=True)[:TOP_N]
+    # Reserved-cap split applied here too -- the SAME AlertConfig numbers
+    # (economy_reserved_slots/premium_reserved_slots) and is_premium_cabin()
+    # classification src/poller.py's real-time alert cap uses, via
+    # select_top_n_with_reserved_quota (see that function's docstring for how
+    # this composes with TOP_N=5: economy_reserved_slots' default of 6
+    # exceeds a 5-slot list, so in practice this only visibly caps premium's
+    # share of each top-5 list -- premium can't crowd out more than
+    # premium_reserved_slots entries, same guarantee the real-time cap gives
+    # economy). Without this, a top-5 list is exactly as vulnerable to
+    # premium dominance as the real-time cap was before the split existed.
+    cash_rank = select_top_n_with_reserved_quota(
+        sorted(grouped_winners, key=lambda e: e.trip_value_usd, reverse=True),
+        TOP_N, config.alerts.economy_reserved_slots, config.alerts.premium_reserved_slots,
+    )
+    cpp_rank = select_top_n_with_reserved_quota(
+        sorted(grouped_winners, key=lambda e: e.cpp, reverse=True),
+        TOP_N, config.alerts.economy_reserved_slots, config.alerts.premium_reserved_slots,
+    )
 
     # Union of both lists, deduped by availability_id -- a candidate in both
     # top-5s only spends one confirm call, not two.

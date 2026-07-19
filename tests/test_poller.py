@@ -361,8 +361,13 @@ def test_run_enforces_max_alerts_per_run_cap():
     because there was no per-run cap -- a wide date window + an empty dedup
     table let every qualifying candidate through. 5 distinct new qualifying
     awards (never seen before, so dedup can't be what's limiting them),
-    cap=3 -- only 3 may send even though all 5 clear the valuation gate."""
-    config = dataclasses.replace(make_config(), alerts=AlertConfig(dedup_ttl_days=5, max_alerts_per_run=3))
+    cap=3 -- only 3 may send even though all 5 clear the valuation gate.
+    make_distinct_awards() is all business cabin, so this exercises
+    premium_reserved_slots specifically -- see the reserved-cap-split tests
+    below for economy vs. premium partitioning itself."""
+    config = dataclasses.replace(
+        make_config(), alerts=AlertConfig(dedup_ttl_days=5, premium_reserved_slots=3),
+    )
     awards = make_distinct_awards(5)
     seats_client = FakeSeatsAeroClient(awards)
     state = InMemoryStateStore()
@@ -395,9 +400,13 @@ def test_poll_route_counts_duplicate_and_capped_skips_separately():
     notifier = FakeNotifier()
 
     cash_provider = FakeCashFareProvider(default_fare=make_fare(price_usd=5900.0))
+    # awards are all business cabin (make_distinct_awards' default), so
+    # premium_reserved_slots is what's actually being exercised here --
+    # economy_reserved_slots is left unbounded (None) since no economy
+    # candidates are in play.
     stats = poll_route(
         FakeSeatsAeroClient(awards), config.origins, route, config, state, notifier,
-        cash_provider=cash_provider, max_alerts_per_run=3,
+        cash_provider=cash_provider, premium_reserved_slots=3,
     )
     assert stats.alerts_sent == 3
     assert stats.skipped_capped == 2
@@ -405,7 +414,7 @@ def test_poll_route_counts_duplicate_and_capped_skips_separately():
 
     stats2 = poll_route(
         FakeSeatsAeroClient(awards), config.origins, route, config, state, notifier,
-        cash_provider=cash_provider, max_alerts_per_run=3,
+        cash_provider=cash_provider, premium_reserved_slots=3,
     )
     assert stats2.skipped_duplicate == 3
     assert stats2.alerts_sent == 2
@@ -417,8 +426,11 @@ def test_run_logs_cap_and_duplicate_counts_separately(caplog):
     distinct number from duplicates and from total evaluated/sent, so a
     future run's logs make it obvious whether the cap was the limiting
     factor (this is precisely what was invisible during the 73-alert
-    flood)."""
-    config = dataclasses.replace(make_config(), alerts=AlertConfig(dedup_ttl_days=5, max_alerts_per_run=1))
+    flood). make_distinct_awards() is all business cabin, so
+    premium_reserved_slots is what's being exercised here."""
+    config = dataclasses.replace(
+        make_config(), alerts=AlertConfig(dedup_ttl_days=5, premium_reserved_slots=1),
+    )
     awards = make_distinct_awards(3)
     seats_client = FakeSeatsAeroClient(awards)
     state = InMemoryStateStore()
@@ -436,6 +448,115 @@ def test_run_logs_cap_and_duplicate_counts_separately(caplog):
     assert "1 alert(s) sent" in summary
     assert "0 skipped as duplicate" in summary
     assert "2 skipped (cap reached)" in summary
+
+
+# --- reserved cap split: economy_reserved_slots/premium_reserved_slots are a
+# hard partition of max_alerts_per_run, NOT a shared pool -- see
+# AlertConfig's own comment for the real measurement that motivated this
+# (business/first structurally out-competed economy for a shared cap every
+# time). Real-time enforcement lives in finish_award_candidate()'s (and
+# classify_candidate()'s, for the independent cash-drop trigger)
+# _reserved_slot_available() check; src/digest.py's ranking applies the
+# identical split via select_top_n_with_reserved_quota (see test_digest.py). ---
+
+
+def _make_config_tracking_economy_and_premium(**alert_overrides) -> WatchlistConfig:
+    """make_config()'s default route only tracks business/first -- widen it
+    to include economy too, so a reserved-cap-split test can supply BOTH
+    tiers in one run. Defaults to the real economy_reserved_slots=6/
+    premium_reserved_slots=2 split unless a test overrides them."""
+    base = make_config()
+    widened_route = dataclasses.replace(base.routes[0], cabins=["economy", "business", "first"])
+    return dataclasses.replace(
+        base, routes=[widened_route, base.routes[1]],
+        alerts=AlertConfig(dedup_ttl_days=5, **alert_overrides),
+    )
+
+
+def make_distinct_awards_for_cabin(n: int, cabin: str, start_month: int) -> list[AwardAvailability]:
+    """Same shape as make_distinct_awards() (distinct calendar months so
+    select_group_winners() never collapses these into each other), but for
+    an explicit cabin so a test can supply independent economy and premium
+    populations in the same run. start_month must leave room for n more
+    months within the same year (1-12) -- callers pick disjoint ranges per
+    cabin purely for test-readability, not because group_key() requires it
+    (cabin is already part of the group key, so same-month economy and
+    business awards are never the same group)."""
+    return [
+        make_award(
+            availability_id=f"{cabin}-iad-fco-2026-{start_month + i:02d}-14",
+            date=datetime.date(2026, start_month + i, 14),
+            cabin=cabin,
+            miles=88000 + i * 10000,
+            economy_miles=50000 + i * 10000,
+        )
+        for i in range(n)
+    ]
+
+
+def test_economy_starved_run_business_fills_its_reserved_slots_without_backfill():
+    """Regression for the whole point of the reserved split: with ZERO
+    qualifying economy candidates this run, business/first must still be
+    capped at its OWN reserved slots (2) -- economy's 6 unused slots must
+    NOT be borrowed to let more business/first through. 4 distinct
+    qualifying business awards, 0 economy -- only 2 of the 4 may send."""
+    config = _make_config_tracking_economy_and_premium()  # default split: economy=6, premium=2
+    business_awards = make_distinct_awards_for_cabin(4, "business", start_month=1)
+    state = InMemoryStateStore()
+    notifier = FakeNotifier()
+    heartbeat = FakeHeartbeat()
+
+    alerts_sent = run(
+        config, cash_provider=FakeCashFareProvider(default_fare=make_fare(price_usd=5900.0)),
+        seats_client=FakeSeatsAeroClient(business_awards), state=state, notifier=notifier, heartbeat=heartbeat,
+    )
+
+    assert alerts_sent == 2  # capped at premium_reserved_slots, NOT backfilled from economy's unused 6
+    assert len(notifier.sent) == 2
+    assert all(award.cabin == "business" for award, *_ in notifier.sent)
+
+
+def test_economy_abundant_run_both_tiers_capped_at_their_own_reserved_slots():
+    """With MORE than enough qualifying candidates in BOTH tiers, each tier
+    sends exactly its own reserved share -- 6 economy + 2 business/first --
+    even though more of each genuinely cleared the valuation gate. Neither
+    tier's surplus spills into the other."""
+    config = _make_config_tracking_economy_and_premium()  # default split: economy=6, premium=2
+    economy_awards = make_distinct_awards_for_cabin(8, "economy", start_month=1)  # 8 qualify, only 6 fit
+    business_awards = make_distinct_awards_for_cabin(4, "business", start_month=9)  # 4 qualify, only 2 fit
+    state = InMemoryStateStore()
+    notifier = FakeNotifier()
+    heartbeat = FakeHeartbeat()
+
+    alerts_sent = run(
+        config, cash_provider=FakeCashFareProvider(default_fare=make_fare(price_usd=5900.0)),
+        seats_client=FakeSeatsAeroClient(economy_awards + business_awards),
+        state=state, notifier=notifier, heartbeat=heartbeat,
+    )
+
+    sent_cabins = [award.cabin for award, *_ in notifier.sent]
+    assert alerts_sent == 8
+    assert sent_cabins.count("economy") == 6
+    assert sent_cabins.count("business") == 2
+
+
+def test_reserved_slot_cap_check_helper_partitions_by_cabin_tier():
+    """Direct unit test of the actual gating primitive, independent of the
+    full run() pipeline above -- confirms an economy candidate is only ever
+    blocked by economy_reserved_slots (never by premium's own count, and
+    vice versa)."""
+    from src.poller import PollStats, _reserved_slot_available
+
+    stats = PollStats()
+    stats.alerts_sent_premium = 2  # premium's reserved slots (2) already exhausted
+    assert not _reserved_slot_available(
+        "business", stats, economy_reserved_slots=6, premium_reserved_slots=2,
+    )
+    # economy's own count (0) is nowhere near its reserved 6 -- premium being
+    # exhausted must not affect economy's own availability.
+    assert _reserved_slot_available(
+        "economy", stats, economy_reserved_slots=6, premium_reserved_slots=2,
+    )
 
 
 # --- v1.1: real cash wiring into the CPP gate + the independent cash-drop trigger ---

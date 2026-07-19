@@ -260,11 +260,13 @@ def test_real_watchlist_europe_broad_route_has_no_origins_override():
     first real digest run found scripts/.dry_run_state.json holds ZERO
     cached baselines for BWI-anything (never queried by anything, ever), so
     a run including it would be fully cache-cold across all 8 destinations,
-    with SerpApi cost potentially doubling versus IAD alone. Deferred, not
-    abandoned -- see watchlist.yaml's comment on this route and
-    SESSION_HANDOFF.md. Targets the LIVE watchlist.yaml specifically (not
-    the fixture) to catch a regression back to re-adding BWI without that
-    same deliberate cost check."""
+    with SerpApi cost potentially doubling versus IAD alone. IAD-only is now
+    the permanent decision, not a cost-driven deferral -- business/first were
+    added alongside economy afterward, tripling per-route cabin fan-out,
+    which only strengthens the case rather than weakening it -- see
+    watchlist.yaml's comment on this route. Targets the LIVE watchlist.yaml
+    specifically (not the fixture) to catch a regression back to re-adding
+    BWI."""
     config = load_watchlist()  # real watchlist.yaml, not the fixture
     europe = next(r for r in config.routes if r.name == "DC → Europe (broad)")
     assert europe.origins is None  # falls back to the top-level list, no override

@@ -264,6 +264,52 @@ def test_digest_selects_top_5_only_even_with_more_ranked_candidates():
     assert [e.cpp for e in result.cpp_rank] == sorted((e.cpp for e in result.cpp_rank), reverse=True)
 
 
+def test_digest_ranking_caps_premium_at_reserved_slots_without_backfilling_economy():
+    """The digest's analogue of src/poller.py's reserved-cap-split tests --
+    applies select_top_n_with_reserved_quota with the SAME
+    economy_reserved_slots/premium_reserved_slots (6/2 by default) before
+    truncating to TOP_N=5. 3 business candidates objectively outrank 5
+    economy candidates by BOTH trip value and cpp (lower taxes, same
+    miles/cash) -- unrestricted, the top-5 would be 3 business + 2 economy.
+    With premium capped at 2, the 3rd-best candidate overall (a business
+    award) must be excluded from BOTH lists in favor of a lower-ranked
+    economy entry -- proving this is a real admission cap, not just
+    "happens to have room," and that economy is never crowded out even
+    though every business candidate here ranks higher."""
+    config = _make_config_tracking_premium_cabins()  # default split: economy=6, premium=2
+    business_awards = [
+        make_award(
+            cabin="business", availability_id=f"biz-{i}", program=f"biz-prog-{i}",
+            date=datetime.date(2026, 5, 11 + i), taxes_usd=50.0 + i * 10, miles=50000,
+            economy_miles=30000,  # ratio 1.67x, well within the default 2.0x premium_cabin_max_multiplier
+        )
+        for i in range(3)  # trip_value/cpp: 1950/3.90, 1940/3.88, 1930/3.86 (highest -> lowest)
+    ]
+    economy_awards = [
+        make_award(
+            cabin="economy", availability_id=f"eco-{i}", program=f"eco-prog-{i}",
+            date=datetime.date(2026, 5, 20 + i), taxes_usd=100.0 + i * 10, miles=50000,
+        )
+        for i in range(5)  # trip_value/cpp: 1900/3.80 down to 1860/3.72
+    ]
+    seats_client = FakeSeatsAeroClient(business_awards + economy_awards)
+    cash_provider = FakeCashFareProvider(2000.0)  # constant cash price -> taxes alone drive the ranking
+    state = InMemoryStateStore()
+
+    result = build_weekly_digest(config, seats_client, cash_provider, state)
+
+    for rank_list in (result.cash_rank, result.cpp_rank):
+        assert len(rank_list) == 5
+        cabins_sent = [e.award.cabin for e in rank_list]
+        assert cabins_sent.count("business") == 2  # capped at premium_reserved_slots, not 3
+        assert cabins_sent.count("economy") == 3  # fills the remaining slots, well within its own 6
+        # The 3rd-best business award (biz-2, $1930/3.86cpp) objectively
+        # outranks 3 of the 5 economy awards on both metrics -- it must
+        # still be excluded, proving the cap isn't just "happened to have
+        # room" but actively rejects a higher-ranked premium candidate.
+        assert "biz-2" not in {e.award.availability_id for e in rank_list}
+
+
 def _make_config_tracking_premium_cabins(**overrides) -> WatchlistConfig:
     """make_config()'s default route only tracks economy -- widen it to
     include business/first so a premium-cabin-ratio test is actually

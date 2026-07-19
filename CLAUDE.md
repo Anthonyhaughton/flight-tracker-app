@@ -302,17 +302,15 @@ ends in `FunctionError`, and the `flight-tracker-app-missed-heartbeat` alarm is 
 `ALARM` state (continuously since 2026-07-17 — confirmed false, safe to ignore, but still
 firing until the real fix ships).
 
-**BWI's exclusion from `DC → Europe (broad)`'s origins — still the right call, but the
-original cost-math justification is now stale and hasn't been explicitly re-confirmed.** The
-`origins` override was removed entirely (deferred, not abandoned — see `watchlist.yaml`'s own
-comment) because a pre-flight check found BWI had never been queried by anything, and adding
-it would make an already-wide route fully cache-cold for that origin. That reasoning was
-computed against an **economy-only** watchlist; business/first have since tripled the
-per-route cabin fan-out, meaning BWI's real incremental cost if re-added is higher than the
-original estimate, not lower — the DECISION (stay IAD-only for now) is if anything reinforced
-by this, but nobody has gone back and explicitly re-run that math against the current 3-cabin
-scope. Not urgent, not blocking anything — just an open confirmation, not a resolved one. See
-`SESSION_HANDOFF.md`'s next steps.
+**BWI is permanently out of scope for `DC → Europe (broad)` — IAD only, not a cost-driven
+deferral.** The `origins` override was removed entirely (2026-07-19 — see `watchlist.yaml`'s
+own comment) because a pre-flight check found BWI had never been queried by anything, and
+adding it would make an already-wide route fully cache-cold for that origin. Business/first
+were re-added alongside economy afterward, tripling per-route cabin fan-out — which only
+strengthens this decision, since BWI's real incremental cost today is higher than the
+original estimate, not lower. This is settled, not an open item — see
+`tests/test_config.py::test_real_watchlist_europe_broad_route_has_no_origins_override`, a
+real-watchlist regression test guarding against re-adding it.
 
 **Steady-state real-world cost measurement is incomplete, and now doubly stale.** "Run 1" (a
 real `scripts/dry_run.py` pass across both routes, 2026-07-19) produced real numbers — 620.3s
