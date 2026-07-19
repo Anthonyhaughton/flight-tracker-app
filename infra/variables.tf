@@ -46,6 +46,18 @@ variable "schedule_enabled" {
   default     = false
 }
 
+variable "digest_schedule_expression" {
+  description = "EventBridge Scheduler cron/rate expression for the weekly digest (see src/digest.py, .claude/skills/deal-valuation). Monday 13:00 UTC by default -- roughly a Monday morning in US Eastern (8/9am depending on DST) for the owner to read at the start of the week."
+  type        = string
+  default     = "cron(0 13 ? * MON *)"
+}
+
+variable "digest_schedule_enabled" {
+  description = "Whether the EventBridge Schedule that triggers the weekly digest ({\"mode\": \"digest\"} event, see src/poller.py's run_digest()) is ENABLED or DISABLED. Independent of schedule_enabled above -- same two-phase discipline, its OWN variable: default false so a first apply creates the schedule without it firing, then a manual invoke (`aws lambda invoke ... --payload '{\"mode\":\"digest\"}'`) verifies a real run against production DynamoDB state before enabling it for real."
+  type        = bool
+  default     = false
+}
+
 variable "heartbeat_missing_after_minutes" {
   description = "How long a missing heartbeat metric must persist before the dead-man's-switch alarm fires. Should exceed the poll interval."
   type        = number

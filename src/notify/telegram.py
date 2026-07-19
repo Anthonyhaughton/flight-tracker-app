@@ -10,6 +10,7 @@ import re
 
 import httpx
 
+from src.digest import DigestEntry, DigestResult
 from src.notify.base import Button
 from src.providers.cash.base import CashFare
 from src.providers.seats_aero import AwardAvailability, parse_trip_taxes_usd
@@ -53,6 +54,9 @@ class TelegramNotifier:
 
     def send_cash_alert(self, fare: CashFare, verdict: Verdict, baseline: Baseline | None) -> None:
         self.send(format_cash_alert(fare, verdict, baseline))
+
+    def send_digest(self, result: DigestResult) -> None:
+        self.send(format_digest_alert(result))
 
     def close(self) -> None:
         self._client.close()
@@ -124,4 +128,55 @@ def format_cash_alert(fare: CashFare, verdict: Verdict, baseline: Baseline | Non
         lines.append(f"\U0001F4B5 {esc(f'${fare.price_usd:,.0f}')} one-way")
     if fare.deep_link:
         lines.append(f"\U0001F517 [Book flight]({fare.deep_link})")
+    return "\n".join(lines)
+
+
+def _format_digest_entry_line(entry: DigestEntry) -> str:
+    esc = escape_markdown_v2
+    program_label = entry.award.program.replace("_", " ").title()
+    match_note = " ⭐" if entry.cleared_real_time_bar else ""
+    return (
+        f"• {esc(entry.award.origin)} → {esc(entry.award.destination)} "
+        f"{esc(entry.award.date.isoformat())}: {esc(program_label)} {esc(f'{entry.award.miles:,}')} mi "
+        f"\\+ \\${esc(f'{entry.taxes_usd:,.0f}')} → \\${esc(f'{entry.comparable_cash_usd:,.0f}')} cash, "
+        f"{esc(f'{entry.cpp:.1f}')}cpp, \\${esc(f'{entry.trip_value_usd:,.0f}')} value{match_note}"
+    )
+
+
+def format_digest_alert(result: DigestResult) -> str:
+    """Single MarkdownV2 message, two sections (Top Cash Value / Top CPP) --
+    NOT ten separate alert-style messages. Mirrors format_digest_embeds'
+    Discord content: an honest "no availability" message when both rankings
+    are empty, and a "nothing cleared the real-time bar" line naming the
+    closest miss when the digest has entries but none would have fired a
+    real alert. See deal-valuation's digest spec."""
+    esc = escape_markdown_v2
+
+    if not result.cash_rank and not result.cpp_rank:
+        return (
+            f"\U0001F4CA *Weekly Deal Digest*\n"
+            f"No award availability found this week \\({esc(result.candidates_evaluated)} "
+            f"candidate\\(s\\) evaluated across all active routes\\)\\."
+        )
+
+    lines = [
+        "\U0001F4CA *Weekly Deal Digest*",
+        "",
+        "\U0001F4B5 *Top Cash Value*",
+        *[_format_digest_entry_line(e) for e in result.cash_rank],
+        "",
+        "\U0001F3AF *Top CPP*",
+        *[_format_digest_entry_line(e) for e in result.cpp_rank],
+    ]
+
+    cleared_any = any(e.cleared_real_time_bar for e in (*result.cash_rank, *result.cpp_rank))
+    if not cleared_any:
+        closest = result.cpp_rank[0]
+        program_label = closest.award.program.replace("_", " ").title()
+        lines += [
+            "",
+            f"Nothing cleared the real\\-time bar this week — closest was {esc(f'{closest.cpp:.1f}')}cpp "
+            f"on {esc(program_label)} \\(floor {esc(f'{closest.real_time_cpp_floor:.1f}')}cpp\\)\\.",
+        ]
+
     return "\n".join(lines)

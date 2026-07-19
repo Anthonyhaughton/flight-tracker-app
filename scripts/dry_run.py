@@ -5,28 +5,34 @@ Get Trips -> exact-date cash confirm -> a real Discord embed in your actual
 channel. Also exercises the independent cash-drop and mistake-fare-ceiling
 triggers.
 
-Exercises the SAME real components src/poller.py's poll_route() uses
-(SeatsAeroClient, SerpApiClient, get_or_refresh_baseline,
-confirm_exact_date_price, is_high_value, is_cash_price_drop,
-is_cash_below_mistake_fare_ceiling, award_key, cash_key, DiscordNotifier),
-rather than calling poll_route() directly, so this script can enforce its
-own explicit per-failure-mode messages -- which poll_route() doesn't have,
-by design (production DOES want auth/quota errors to propagate loudly
-rather than being swallowed with a friendly message).
+Calls src/poller.py's evaluate_candidate() -- the ONE shared per-candidate
+decision pipeline (prefilter -> cash triggers -> first-pass gate -> dedup
+-> cap -> Get Trips + exact-date confirm -> final gate -> notify + record)
+that src/poller.py's poll_route() ALSO calls -- rather than reimplementing
+that logic here a second time. This script supplies its own `fetch_trip`
+callback (Get Trips + exact-date confirm), since that's the one place this
+script's needs genuinely differ from production's: explicit per-failure-mode
+messages and aborting the whole run loudly on auth/quota failures, vs
+production's policy of propagating a Get Trips failure and swallowing a
+confirm failure broadly (see src/poller.py's module docstring for the full
+reasoning). Everything else -- the actual gating decision -- is the exact
+same function call production makes, not a parallel copy of it. An earlier
+version of this script DID reimplement that logic independently, which is
+exactly what let it drift out of sync with production twice before (missed
+a trips[0] regression, and later never gained the v1.1 cash wiring at all,
+so it silently kept exercising v1.0-only behavior even after production had
+real CPP gating) -- calling the same function removes that entire class of
+drift structurally, not just by discipline.
 
 Targets ONE real configured route from watchlist.yaml, selected via
 --route "<route name>" (required -- no default, deliberately, so a bare
 invocation can never accidentally trigger whichever route happens to be
 first/largest). Reads that route's real origins (falling back to the
-top-level list, same as production), destinations, cabins, date_window, and
-require_cash_comparison directly off the loaded config -- NOT separate
-hardcoded constants. An earlier version of this script hardcoded its own
-ORIGIN/DESTINATION/CABINS/WINDOW constants instead of reading them from
-watchlist.yaml, which is exactly the kind of drift that has bitten this
-script twice before (missed a trips[0] regression, and later never gained
-the v1.1 cash wiring at all, so it silently kept exercising v1.0-only
-behavior even after production had real CPP gating). Reading the real route
-config directly removes that entire class of drift.
+top-level list, same as production), destinations, cabins, and date_window
+directly off the loaded config -- NOT separate hardcoded constants. A
+candidate with no resolved cash price always skips (src/valuation.py's
+is_high_value) -- there is no per-route opt-out of this, on this script or
+in production.
 
 Real API call budget varies substantially by --route, since routes have very
 different fan-out (e.g. DC -> Italy: 1 origin x 1 destination; DC -> Europe
@@ -79,12 +85,37 @@ across every candidate where both were actually computed (pass or fail), so
 "how close are the current thresholds" is answerable from one run's real
 data rather than guessing or re-running with different values.
 
+--mode digest exercises the weekly digest instead of the real-time path:
+real Cached Search across EVERY active route (no --route needed or
+accepted -- the digest is explicitly a cross-route aggregate, see
+deal-valuation's digest spec) -> eligible_programs/cabin prefilter ->
+ranking by the cheap weekly-bucketed estimate for every survivor, not just
+gate-passers -> top-5-by-cash-value + top-5-by-CPP (independent lists) ->
+one real exact-date confirm call per distinct finalist across both lists
+(<=10 total, not up to 10 each) -> a real Discord digest embed set. Calls
+src/digest.py's build_weekly_digest() -- the SAME function src/poller.py's
+run_digest() (the Lambda digest path) calls -- for the exact same
+avoiding-duplicate-implementations reason this script already calls
+evaluate_candidate() for the real-time path above. --max-alerts doesn't
+apply in this mode (there's no per-run send cap on a digest -- it ranks and
+reports everything, see src/digest.py). --origins/--destinations DO apply,
+applied UNIFORMLY to every active route the digest walks (there's no single
+--route to scope to in digest mode, unlike the real-time path above) -- pass
+either to scope down a first real verification run's cost the same way they
+already scope down the real-time path's one selected route, e.g. to check a
+known-small slice against real cache state before a full run.
+--cpp-floor/--min-trip-value still apply too, since they affect config.awards
+uniformly regardless of mode.
+
 Not wired into the poller or scheduler. Run manually:
 
     python scripts/dry_run.py --route "DC → Italy"
     python scripts/dry_run.py --route "DC → Europe (broad)"
     python scripts/dry_run.py --route "DC → Europe (broad)" --max-alerts 3
     python scripts/dry_run.py --route "DC → Europe (broad)" --origins IAD --destinations LHR --cpp-floor 2.0 --min-trip-value 250
+    python scripts/dry_run.py --mode digest
+    python scripts/dry_run.py --mode digest --origins IAD --destinations LHR,BCN
+    python scripts/dry_run.py --mode digest --cpp-floor 2.0 --min-trip-value 250
 
 Dedup + baseline state persists to scripts/.dry_run_state.json (gitignored)
 across runs of this script specifically -- production uses DynamoDB
@@ -113,7 +144,9 @@ sys.path.insert(0, str(REPO_ROOT))
 from src import secrets  # noqa: E402
 from src.cash import confirm_exact_date_price, get_or_refresh_baseline  # noqa: E402
 from src.config import load_watchlist  # noqa: E402
+from src.digest import build_weekly_digest  # noqa: E402
 from src.notify.discord import DiscordError, DiscordNotifier  # noqa: E402
+from src.poller import PollStats, TripFetchResult, evaluate_candidate  # noqa: E402
 from src.providers.cash.serpapi import (  # noqa: E402
     SerpApiAuthError,
     SerpApiClient,
@@ -121,20 +154,14 @@ from src.providers.cash.serpapi import (  # noqa: E402
     SerpApiTimeoutError,
 )
 from src.providers.seats_aero import (  # noqa: E402
+    AwardAvailability,
     SeatsAeroAuthError,
     SeatsAeroClient,
     SeatsAeroRateLimitError,
     parse_trip_taxes_usd,
-    select_trip_for_cabin,
 )
-from src.state import Baseline, award_key, cash_key, compute_updated_baseline  # noqa: E402
-from src.valuation import (  # noqa: E402
-    compute_effective_cpp,
-    is_cash_below_mistake_fare_ceiling,
-    is_cash_price_drop,
-    is_high_value,
-    passes_award_prefilter,
-)
+from src.state import Baseline, compute_updated_baseline  # noqa: E402
+from src.valuation import compute_effective_cpp, passes_award_prefilter  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 logger = logging.getLogger("dry_run")
@@ -239,8 +266,14 @@ def main() -> int:
 
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument(
-        "--route", required=True, choices=[r.name for r in config.routes],
-        help="Real route name from watchlist.yaml to exercise -- required, no default.",
+        "--mode", choices=["realtime", "digest"], default="realtime",
+        help="'realtime' (default) exercises evaluate_candidate() for ONE route (--route required). "
+        "'digest' exercises build_weekly_digest() across EVERY active route (--route not accepted).",
+    )
+    parser.add_argument(
+        "--route", default=None, choices=[r.name for r in config.routes],
+        help="Real route name from watchlist.yaml to exercise -- required for --mode realtime, "
+        "not accepted for --mode digest (which always covers every active route).",
     )
     parser.add_argument(
         "--max-alerts", type=int, default=None,
@@ -252,13 +285,15 @@ def main() -> int:
         "--origins", type=str, default=None,
         help="Comma-separated origin override for THIS run only (e.g. 'IAD') -- scopes down a "
         "wide route's fan-out for a cheaper first look, without editing watchlist.yaml. Defaults "
-        "to the route's real origins (its own override, or the top-level list).",
+        "to the route's real origins (its own override, or the top-level list). In --mode digest "
+        "(no single --route to scope), applies UNIFORMLY to every active route the digest walks.",
     )
     parser.add_argument(
         "--destinations", type=str, default=None,
         help="Comma-separated destination override for THIS run only (e.g. 'LHR,BCN') -- scopes "
         "down a wide route's fan-out for a cheaper first look, without editing watchlist.yaml. "
-        "Defaults to the route's real destinations.",
+        "Defaults to the route's real destinations. In --mode digest, applies UNIFORMLY to every "
+        "active route the digest walks, same as --origins.",
     )
     parser.add_argument(
         "--cpp-floor", type=float, default=None,
@@ -272,6 +307,107 @@ def main() -> int:
         "revert needed.",
     )
     args = parser.parse_args()
+
+    if args.mode == "realtime" and args.route is None:
+        parser.error("--route is required for --mode realtime (omit it, or pass --mode digest, to run the digest)")
+    if args.mode == "digest" and args.route is not None:
+        parser.error("--route is not accepted for --mode digest -- the digest always covers every active route")
+
+    # --cpp-floor / --min-trip-value are in-memory overrides ONLY -- config.awards
+    # itself (and watchlist.yaml) is never mutated, so there is nothing to
+    # revert regardless of how this run ends. Applies uniformly to both
+    # modes: the digest's ranking math (src/digest.py) reads config.awards
+    # the exact same way evaluate_candidate() does.
+    awards_config = config.awards
+    if args.cpp_floor is not None:
+        awards_config = dataclasses.replace(
+            awards_config, cpp_floors={k: args.cpp_floor for k in awards_config.cpp_floors}
+        )
+    if args.min_trip_value is not None:
+        awards_config = dataclasses.replace(awards_config, min_trip_value_usd=args.min_trip_value)
+    if args.cpp_floor is not None or args.min_trip_value is not None:
+        logger.info(
+            "THRESHOLD OVERRIDE active for this run only (watchlist.yaml untouched): cpp_floor=%s "
+            "(real config: %s), min_trip_value_usd=%s (real config: $%s)",
+            args.cpp_floor if args.cpp_floor is not None else "unchanged", config.awards.cpp_floors,
+            args.min_trip_value if args.min_trip_value is not None else "unchanged", config.awards.min_trip_value_usd,
+        )
+    # Fold the (possibly overridden) awards config into `config` itself,
+    # AFTER logging the real vs. overridden comparison above -- everything
+    # downstream (evaluate_candidate() and build_weekly_digest() alike) reads
+    # config.awards uniformly from here on, rather than a separate variable
+    # it would have no way to know to use instead.
+    config = dataclasses.replace(config, awards=awards_config)
+
+    client = SeatsAeroClient(seats_api_key, max_retries=0)
+    cash_client = SerpApiClient(serpapi_key, max_retries=0)
+    notifier = DiscordNotifier(discord_webhook_url)
+    state = FileStateStore(STATE_FILE_PATH)
+
+    if args.mode == "digest":
+        # --origins/--destinations, when given, apply UNIFORMLY to every
+        # active route -- unlike realtime mode, digest mode has no single
+        # --route to scope an override to (it always walks every active
+        # route by design, see deal-valuation's digest spec). In-memory
+        # dataclasses.replace only, same as --cpp-floor/--min-trip-value
+        # above -- watchlist.yaml itself is never touched, nothing to revert.
+        digest_config = config
+        override_origins = (
+            [o.strip() for o in args.origins.split(",") if o.strip()] if args.origins is not None else None
+        )
+        override_destinations = (
+            [d.strip() for d in args.destinations.split(",") if d.strip()] if args.destinations is not None else None
+        )
+        if override_origins is not None or override_destinations is not None:
+            replaced_routes = []
+            for r in digest_config.routes:
+                fields = {}
+                if override_origins is not None:
+                    fields["origins"] = override_origins
+                if override_destinations is not None:
+                    fields["destinations"] = override_destinations
+                replaced_routes.append(dataclasses.replace(r, **fields))
+            digest_config = dataclasses.replace(digest_config, routes=replaced_routes)
+            logger.info(
+                "ORIGIN/DESTINATION OVERRIDE active for this run only (watchlist.yaml untouched), applied "
+                "to EVERY active route: origins=%s destinations=%s",
+                override_origins if override_origins is not None else "unchanged (per-route real config)",
+                override_destinations if override_destinations is not None else "unchanged (per-route real config)",
+            )
+
+        est_calls = sum(
+            len(r.origins if r.origins is not None else digest_config.origins) * len(r.destinations)
+            for r in digest_config.active_routes()
+        )
+        logger.info(
+            "PRE-FLIGHT (digest): this run will issue EXACTLY %d seats.aero Cached Search call(s) across "
+            "%d active route(s), plus up to 10 SerpApi exact-date-confirm calls (bounded by the union of "
+            "the top-5-cash and top-5-CPP finalist lists, deduped -- a candidate in both lists costs one "
+            "call, not two). SerpApi weekly-baseline call volume is the SAME bounded, cache-first cost the "
+            "real-time path already has, not a new call type.",
+            est_calls, len(digest_config.active_routes()),
+        )
+        try:
+            result = build_weekly_digest(digest_config, client, cash_client, state)
+            notifier.send_digest(result)
+        except DiscordError as exc:
+            logger.error("DISCORD SEND FAILED: %s", exc)
+            return 1
+        except (SeatsAeroAuthError, SeatsAeroRateLimitError, SerpApiAuthError, SerpApiRateLimitError) as exc:
+            logger.error("Aborting: %s", exc)
+            return 1
+        finally:
+            client.close()
+            cash_client.close()
+            notifier.close()
+
+        logger.info(
+            "Done. digest: %d candidate(s) evaluated, %d ranked, %d cash-rank entr(y/ies), "
+            "%d cpp-rank entr(y/ies).",
+            result.candidates_evaluated, result.candidates_ranked, len(result.cash_rank), len(result.cpp_rank),
+        )
+        logger.info("Check Discord -- a digest embed set should have landed in the channel.")
+        return 0
 
     route = next(r for r in config.routes if r.name == args.route)
     if args.origins is not None:
@@ -287,31 +423,13 @@ def main() -> int:
     start, end = route.date_window.to_dates()
     max_alerts = args.max_alerts if args.max_alerts is not None else config.alerts.max_alerts_per_run
 
-    # --cpp-floor / --min-trip-value are in-memory overrides ONLY -- config.awards
-    # itself (and watchlist.yaml) is never mutated, so there is nothing to
-    # revert regardless of how this run ends.
-    awards_config = config.awards
-    if args.cpp_floor is not None:
-        awards_config = dataclasses.replace(
-            awards_config, cpp_floors={k: args.cpp_floor for k in awards_config.cpp_floors}
-        )
-    if args.min_trip_value is not None:
-        awards_config = dataclasses.replace(awards_config, min_trip_value_usd=args.min_trip_value)
-
     est_cached_search_calls = len(origins) * len(destinations)
     logger.info(
-        "Route: %r | origins=%s destinations=%s cabins=%s dates=%s..%s | require_cash_comparison=%s | "
+        "Route: %r | origins=%s destinations=%s cabins=%s dates=%s..%s | "
         "eligible_programs=%s | send cap=%d",
         route.name, origins, destinations, cabins, start.isoformat(), end.isoformat(),
-        route.require_cash_comparison, config.eligible_programs, max_alerts,
+        config.eligible_programs, max_alerts,
     )
-    if args.cpp_floor is not None or args.min_trip_value is not None:
-        logger.info(
-            "THRESHOLD OVERRIDE active for this run only (watchlist.yaml untouched): cpp_floor=%s "
-            "(real config: %s), min_trip_value_usd=%s (real config: $%s)",
-            args.cpp_floor if args.cpp_floor is not None else "unchanged", config.awards.cpp_floors,
-            args.min_trip_value if args.min_trip_value is not None else "unchanged", config.awards.min_trip_value_usd,
-        )
     logger.info(
         "PRE-FLIGHT: this run will issue EXACTLY %d seats.aero Cached Search call(s) "
         "(%d origin(s) x %d destination(s)), plus up to %d Get Trips call(s) (bounded by the send "
@@ -324,18 +442,14 @@ def main() -> int:
         est_cached_search_calls, len(origins), len(destinations), max_alerts,
     )
 
-    client = SeatsAeroClient(seats_api_key, max_retries=0)
-    cash_client = SerpApiClient(serpapi_key, max_retries=0)
-    notifier = DiscordNotifier(discord_webhook_url)
-    state = FileStateStore(STATE_FILE_PATH)
-
-    candidates_seen = 0
-    sent = 0
+    # The SAME PollStats production's poll_route() uses -- no parallel set
+    # of counters reimplementing what evaluate_candidate() already tracks.
+    # Only what PollStats genuinely doesn't have (ceiling-vs-drop split,
+    # timeouts -- neither meaningful to production) are tracked separately
+    # below, read out of each CandidateResult / the fetch_trip callback.
+    stats = PollStats()
     cash_drop_sent = 0
     ceiling_sent = 0
-    skipped_duplicate = 0
-    skipped_capped = 0
-    skipped_other = 0
     skipped_timeout = 0
     cached_search_calls = 0
     get_trips_calls = 0
@@ -349,6 +463,82 @@ def main() -> int:
     # is answerable from real data instead of re-running with different values.
     computed_cpps: list[float] = []
     computed_trip_values: list[float] = []
+
+    # Written by fetch_trip (below) each time it's actually called, read by
+    # the per-award loop right after evaluate_candidate() returns -- lets
+    # the loop compute the FINAL (post-confirm) distribution point without
+    # duplicating fetch_trip's own knowledge of the confirmed price.
+    # fetch_trip doesn't know the FINAL taxes (that requires the specific
+    # trip evaluate_candidate selects for the award's cabin, which happens
+    # after fetch_trip returns), so the loop combines this with
+    # result.award.trip once evaluate_candidate has run.
+    last_confirmed_cash_usd: float | None = None
+
+    def fetch_trip(award: AwardAvailability, comparable_cash_usd: float) -> TripFetchResult:
+        """This script's Get-Trips + exact-date-confirm policy: unlike
+        production's poll_route() (which lets a Get Trips failure propagate
+        loudly and swallows a confirm failure broadly), this script wants
+        explicit per-failure-mode messages and aborts the WHOLE run on
+        auth/quota failures for either call (re-raising lets main()'s outer
+        except clause -- below -- turn that into a clean `return 1`) while
+        treating a SerpApi timeout as a skip of just this one candidate."""
+        nonlocal get_trips_calls, serpapi_confirm_calls, skipped_timeout, last_confirmed_cash_usd
+        last_confirmed_cash_usd = None
+
+        try:
+            trips = client.get_trips(award.availability_id)
+        except SeatsAeroAuthError:
+            logger.error("AUTH FAILED (401/403) on Get Trips for %s", award.availability_id)
+            raise
+        except SeatsAeroRateLimitError:
+            logger.error(
+                "RATE LIMITED (429) on Get Trips for %s -- quota was exhausted mid-run", award.availability_id
+            )
+            raise
+
+        get_trips_calls += 1
+        logger.info("X-RateLimit-Remaining: %s", client.last_rate_limit_remaining)
+
+        if not trips:
+            logger.info("SKIP %s: Get Trips returned nothing (space likely gone)", award.availability_id)
+            return TripFetchResult(
+                trips=None, confirmed_cash_usd=None, skip_reason="Get Trips returned nothing (space likely gone)",
+            )
+
+        try:
+            confirmed_cash_usd = confirm_exact_date_price(
+                cash_client, origin=award.origin, destination=award.destination,
+                cabin=award.cabin, date=award.date,
+            )
+        except SerpApiAuthError:
+            logger.error("AUTH FAILED (401) on SerpApi exact-date confirm for %s", award.availability_id)
+            raise
+        except SerpApiRateLimitError:
+            logger.error(
+                "RATE LIMITED / QUOTA EXHAUSTED (429) on SerpApi exact-date confirm for %s", award.availability_id,
+            )
+            raise
+        except SerpApiTimeoutError as exc:
+            logger.warning(
+                "TIMEOUT on SerpApi exact-date confirm for %s -- transient, skipping this "
+                "candidate (not fatal, unlike auth/quota failures): %s", award.availability_id, exc,
+            )
+            skipped_timeout += 1
+            return TripFetchResult(
+                trips=trips, confirmed_cash_usd=None, skip_reason="SerpApi timeout on exact-date confirm",
+            )
+
+        serpapi_confirm_calls += 1
+        if confirmed_cash_usd is not None:
+            logger.info(
+                "cash EXACT-DATE CONFIRM for %s: $%.0f (weekly estimate was $%.0f) (real SerpApi call)",
+                award.availability_id, confirmed_cash_usd, comparable_cash_usd,
+            )
+            last_confirmed_cash_usd = confirmed_cash_usd
+        # else: evaluate_candidate() logs its own generic "no exact-date
+        # cash price to confirm..." message -- no need to duplicate it here.
+
+        return TripFetchResult(trips=trips, confirmed_cash_usd=confirmed_cash_usd)
 
     try:
         for origin in origins:
@@ -377,10 +567,13 @@ def main() -> int:
             )
 
             for award in hits:
-                candidates_seen += 1
+                stats.candidates_evaluated += 1
 
+                # Cheap, pure-function check before spending a (cheap but not
+                # free) baseline lookup -- deliberately NOT inside
+                # evaluate_candidate(); see that function's docstring for why.
                 if not passes_award_prefilter(award, wanted_cabins, config.eligible_programs):
-                    skipped_other += 1
+                    stats.skipped_other += 1
                     continue
 
                 try:
@@ -409,198 +602,86 @@ def main() -> int:
                 if cash_update.refreshed:
                     serpapi_weekly_calls += 1
 
-                comparable_cash_usd = None
                 if cash_update.current_fare is not None:
-                    comparable_cash_usd = cash_update.current_fare.price_usd
                     logger.info(
                         "cash baseline REFRESHED for %s (weekly bucket): $%.0f (real SerpApi call)",
                         cash_update.key, cash_update.current_fare.price_usd,
                     )
                 elif cash_update.baseline is not None:
-                    comparable_cash_usd = cash_update.baseline.ema_usd
-                    logger.info("cash baseline CACHED for %s: $%.0f typical (no SerpApi call)", cash_update.key, comparable_cash_usd)
+                    logger.info(
+                        "cash baseline CACHED for %s: $%.0f typical (no SerpApi call)",
+                        cash_update.key, cash_update.baseline.ema_usd,
+                    )
                 else:
                     logger.info("no cash data available for %s", cash_update.key)
 
-                if comparable_cash_usd is not None and award.taxes_usd is not None:
-                    computed_trip_values.append(comparable_cash_usd - award.taxes_usd)
-                    computed_cpps.append(compute_effective_cpp(comparable_cash_usd, award.taxes_usd, award.miles))
-
-                verdict = is_high_value(
-                    award, awards_config, wanted_cabins, comparable_cash_usd=comparable_cash_usd, taxes_usd=award.taxes_usd,
-                    require_cash_comparison=route.require_cash_comparison,
+                # First-pass distribution point -- the weekly-bucketed
+                # estimate, before Get Trips/confirm. See evaluate_candidate()
+                # for the identical derivation of comparable_cash_usd from
+                # cash_update; duplicated here ONLY for this script's own
+                # distribution tracking, not for any gating decision.
+                first_pass_cash_usd = (
+                    cash_update.current_fare.price_usd if cash_update.current_fare is not None
+                    else cash_update.baseline.ema_usd if cash_update.baseline is not None
+                    else None
                 )
+                if first_pass_cash_usd is not None and award.taxes_usd is not None:
+                    computed_trip_values.append(first_pass_cash_usd - award.taxes_usd)
+                    computed_cpps.append(compute_effective_cpp(first_pass_cash_usd, award.taxes_usd, award.miles))
 
-                # --- two independent cash triggers, piggybacking on the SAME
-                # baseline refresh above -- see src/poller.py's poll_route()
-                # for the identical shape. Ceiling checked first (fires even
-                # on a route's first-ever observation); drop trigger only if
-                # ceiling didn't fire AND previous is not None (seeded
-                # silently otherwise). Both share one dedup key. NEITHER is
-                # gated by the send cap being reached in this section --
-                # matches poll_route()'s real ordering (cap only blocks the
-                # actual send, never the cheap evaluation).
-                if cash_update.refreshed and cash_update.current_fare is not None:
-                    cash_verdict = is_cash_below_mistake_fare_ceiling(cash_update.current_fare.price_usd, config.cash)
-                    is_ceiling = cash_verdict.fire
-                    if not cash_verdict.fire and cash_update.previous is not None:
-                        cash_verdict = is_cash_price_drop(cash_update.current_fare.price_usd, cash_update.previous, config.cash)
-
-                    if cash_verdict.fire:
-                        c_key = cash_key(cash_update.current_fare)
-                        if state.already_alerted(c_key):
-                            logger.info("SKIP cash %s: already alerted previously (duplicate)", c_key)
-                            skipped_duplicate += 1
-                        elif sent >= max_alerts:
-                            logger.info("SKIP cash %s: send cap (%d) reached but candidate genuinely matched", c_key, max_alerts)
-                            skipped_capped += 1
-                        else:
-                            try:
-                                notifier.send_cash_alert(cash_update.current_fare, cash_verdict, cash_update.previous)
-                            except DiscordError as exc:
-                                logger.error("DISCORD SEND FAILED for cash %s: %s", c_key, exc)
-                                return 1
-                            state.record_alert(c_key, ttl_seconds=config.alerts.dedup_ttl_days * 86400)
-                            sent += 1
-                            if is_ceiling:
-                                ceiling_sent += 1
-                            else:
-                                cash_drop_sent += 1
-                            logger.info(
-                                "SENT cash %s: $%.0f (%s)", c_key, cash_update.current_fare.price_usd, cash_verdict.reason,
-                            )
-
-                if not verdict.fire:
-                    logger.info("SKIP %s: %s", award.availability_id, verdict.reason)
-                    skipped_other += 1
-                    continue
-
-                key = award_key(award)
-                if state.already_alerted(key):
-                    logger.info("SKIP %s: already alerted previously (duplicate), key=%s", award.availability_id, key)
-                    skipped_duplicate += 1
-                    continue
-
-                if sent >= max_alerts:
-                    logger.info(
-                        "SKIP %s: send cap (%d) reached but candidate genuinely cleared the first-pass gate "
-                        "(no Get Trips call spent)", award.availability_id, max_alerts,
-                    )
-                    skipped_capped += 1
-                    continue
-
+                last_confirmed_cash_usd = None
                 try:
-                    trips = client.get_trips(award.availability_id)
-                except SeatsAeroAuthError:
-                    logger.error("AUTH FAILED (401/403) on Get Trips for %s", award.availability_id)
-                    return 1
-                except SeatsAeroRateLimitError:
-                    logger.error(
-                        "RATE LIMITED (429) on Get Trips for %s -- quota was exhausted mid-run", award.availability_id
+                    result = evaluate_candidate(
+                        award, route, config, state, notifier, cash_update, fetch_trip,
+                        max_alerts_per_run=max_alerts, stats=stats,
                     )
-                    return 1
-
-                get_trips_calls += 1
-                logger.info("X-RateLimit-Remaining: %s", client.last_rate_limit_remaining)
-
-                if not trips:
-                    logger.info("SKIP %s: Get Trips returned nothing (space likely gone)", award.availability_id)
-                    skipped_other += 1
-                    continue
-
-                # Get Trips returns itineraries across ALL cabins on this
-                # availability (confirmed live: 88 trips for one business-cabin
-                # hit) -- trips[0] is not guaranteed to be award.cabin.
-                trip = select_trip_for_cabin(trips, award.cabin)
-                if trip is None:
-                    logger.info(
-                        "SKIP %s: no %s-cabin trip among %d Get Trips result(s)",
-                        award.availability_id, award.cabin, len(trips),
-                    )
-                    skipped_other += 1
-                    continue
-
-                # Exact-date cash confirm: the weekly-bucketed baseline above is
-                # accurate enough to decide candidacy, but not to gate a real
-                # send -- day-of-week price variance can be large. Spend ONE
-                # additional real SerpApi call for this award's EXACT date, only
-                # now that the candidate has cleared everything else. See
-                # src/cash.py's confirm_exact_date_price and src/poller.py's
-                # matching step.
-                if comparable_cash_usd is not None:
-                    try:
-                        confirmed_cash_usd = confirm_exact_date_price(
-                            cash_client, origin=award.origin, destination=award.destination,
-                            cabin=award.cabin, date=award.date,
-                        )
-                    except SerpApiAuthError:
-                        logger.error("AUTH FAILED (401) on SerpApi exact-date confirm for %s", award.availability_id)
-                        return 1
-                    except SerpApiRateLimitError:
-                        logger.error(
-                            "RATE LIMITED / QUOTA EXHAUSTED (429) on SerpApi exact-date confirm for %s",
-                            award.availability_id,
-                        )
-                        return 1
-                    except SerpApiTimeoutError as exc:
-                        logger.warning(
-                            "TIMEOUT on SerpApi exact-date confirm for %s -- transient, skipping this "
-                            "candidate (not fatal, unlike auth/quota failures): %s", award.availability_id, exc,
-                        )
-                        skipped_timeout += 1
-                        continue
-
-                    serpapi_confirm_calls += 1
-
-                    if confirmed_cash_usd is None:
-                        logger.info(
-                            "SKIP %s: no exact-date cash price to confirm the weekly-bucketed estimate",
-                            award.availability_id,
-                        )
-                        skipped_other += 1
-                        continue
-
-                    logger.info(
-                        "cash EXACT-DATE CONFIRM for %s: $%.0f (weekly estimate was $%.0f) (real SerpApi call)",
-                        award.availability_id, confirmed_cash_usd, comparable_cash_usd,
-                    )
-                    comparable_cash_usd = confirmed_cash_usd
-
-                real_taxes_usd = parse_trip_taxes_usd(trip)
-                if comparable_cash_usd is not None:
-                    computed_trip_values.append(comparable_cash_usd - real_taxes_usd)
-                    computed_cpps.append(compute_effective_cpp(comparable_cash_usd, real_taxes_usd, award.miles))
-
-                real_verdict = is_high_value(
-                    award, awards_config, wanted_cabins,
-                    comparable_cash_usd=comparable_cash_usd, taxes_usd=real_taxes_usd,
-                    require_cash_comparison=route.require_cash_comparison,
-                )
-                if not real_verdict.fire:
-                    logger.info("SKIP %s: failed real-numbers recheck (%s)", award.availability_id, real_verdict.reason)
-                    skipped_other += 1
-                    continue
-
-                try:
-                    notifier.send_award_alert(award, real_verdict, trip)
                 except DiscordError as exc:
                     logger.error("DISCORD SEND FAILED for %s: %s", award.availability_id, exc)
                     return 1
+                except (SeatsAeroAuthError, SeatsAeroRateLimitError, SerpApiAuthError, SerpApiRateLimitError):
+                    # fetch_trip already logged the specific failure --
+                    # abort the whole run, matching this script's
+                    # "propagate auth/quota loudly" policy.
+                    return 1
 
-                state.record_alert(key, ttl_seconds=config.alerts.dedup_ttl_days * 86400)
-                sent += 1
-                logger.info(
-                    "SENT %s: %s %s->%s, %s miles",
-                    award.availability_id, award.cabin, award.origin, award.destination, f"{trip['MileageCost']:,}",
-                )
+                # Final (post-confirm) distribution point -- only when
+                # fetch_trip actually reached and confirmed a real price
+                # AND evaluate_candidate got far enough to select a trip.
+                if last_confirmed_cash_usd is not None and result.award.trip is not None:
+                    real_taxes_usd = parse_trip_taxes_usd(result.award.trip)
+                    computed_trip_values.append(last_confirmed_cash_usd - real_taxes_usd)
+                    computed_cpps.append(compute_effective_cpp(last_confirmed_cash_usd, real_taxes_usd, award.miles))
+
+                if result.cash.outcome == "sent":
+                    is_ceiling = result.cash.verdict is not None and result.cash.verdict.reason == "possible mistake fare (absolute ceiling)"
+                    if is_ceiling:
+                        ceiling_sent += 1
+                    else:
+                        cash_drop_sent += 1
+                    logger.info(
+                        "SENT cash %s: $%.0f (%s)", result.cash.key, result.cash.fare.price_usd, result.cash.verdict.reason,
+                    )
+                elif result.cash.outcome == "duplicate":
+                    logger.info("SKIP cash %s: already alerted previously (duplicate)", result.cash.key)
+                # "capped" is already logged by evaluate_candidate itself;
+                # "not_triggered" needs no log.
+
+                if result.award.outcome == "sent":
+                    logger.info(
+                        "SENT %s: %s %s->%s, %s miles",
+                        award.availability_id, award.cabin, award.origin, award.destination,
+                        f"{result.award.trip['MileageCost']:,}",
+                    )
+                elif not result.award.already_logged:
+                    logger.info("SKIP %s: %s", award.availability_id, result.award.reason)
 
         logger.info(
             "Done. route=%r %d candidate(s) seen across program(s) %s. %d sent (%d award, %d cash-drop, "
             "%d mistake-fare-ceiling), %d skipped-as-duplicate, %d skipped-capped (genuinely matched, "
             "lost the send-cap race), %d skipped-timeout (transient, not a real rejection), %d skipped-other.",
-            route.name, candidates_seen, sorted(programs_seen_overall),
-            sent, sent - cash_drop_sent - ceiling_sent, cash_drop_sent, ceiling_sent,
-            skipped_duplicate, skipped_capped, skipped_timeout, skipped_other,
+            route.name, stats.candidates_evaluated, sorted(programs_seen_overall),
+            stats.alerts_sent, stats.alerts_sent - cash_drop_sent - ceiling_sent, cash_drop_sent, ceiling_sent,
+            stats.skipped_duplicate, stats.skipped_capped, skipped_timeout, stats.skipped_other,
         )
         logger.info(
             "Real call totals -- seats.aero: %d Cached Search + %d Get Trips = %d. "
@@ -619,14 +700,14 @@ def main() -> int:
             )
         else:
             logger.info("No candidate had both a resolved cash price and known taxes -- no value distribution to report.")
-        if skipped_capped > 0:
+        if stats.skipped_capped > 0:
             logger.info(
                 "%d candidate(s) genuinely cleared the first-pass gate but lost the send-cap (%d) race this run -- "
                 "the cap IS limiting real coverage for this route at this cap value.",
-                skipped_capped, max_alerts,
+                stats.skipped_capped, max_alerts,
             )
-        if sent > 0:
-            logger.info("Check Discord -- %d embed(s) should have landed in the channel.", sent)
+        if stats.alerts_sent > 0:
+            logger.info("Check Discord -- %d embed(s) should have landed in the channel.", stats.alerts_sent)
         else:
             logger.info("Nothing sent this run.")
         return 0

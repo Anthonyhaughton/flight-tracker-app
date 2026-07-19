@@ -108,6 +108,29 @@ includes an `X-RateLimit-Remaining` header; log it. Design for it:
   "API" tab under Settings, there is no key to generate; that's a signup-time check, not a
   code bug.
 
+## The live Concepts doc's Sources table is NOT authoritative — verify against real results
+
+**Real finding, not a hypothetical.** The Concepts doc's Sources table (referenced below) is
+the obvious place to look for the full list of program/source keys, and it's wrong — not
+stale in a minor way, but missing entries entirely. Building an `eligible_programs`
+allow-list (see `deal-valuation`) from that table alone and cross-referencing it against
+Amex Membership Rewards / Chase Ultimate Rewards transfer partners initially concluded
+British Airways and Iberia had no seats.aero source key at all. A real Cached Search
+(IAD → LHR/BCN/MAD, wide date window) proved that wrong immediately: `british` and `iberia`
+both appeared in real results, fully populated, functioning exactly like any documented
+source.
+
+**The lesson generalizes beyond this one table:** whenever a task involves building a
+program/source-key eligibility filter (or any allow-list derived from an API's documented
+enum), do not trust the doc text as the ground truth. Run one real, broad query against the
+live API and inspect what actually comes back — the doc is a *starting point* for what to
+expect, not proof of what's absent. Absence from a real query result IS meaningful signal
+(if a program never appears across enough real queries, that's real evidence); absence from
+*documentation* is not, on its own. Where doc and live results genuinely disagree, live wins,
+and the disagreement itself is worth recording (in `watchlist.yaml`'s config comments, in
+this skill, wherever the list lives) so the next person doesn't silently re-trust the doc and
+undo the finding.
+
 ## Normalization: track by program, not by airline
 
 The same physical seat (e.g., an ANA or Qatar flight) appears under multiple programs at

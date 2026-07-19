@@ -66,18 +66,6 @@ def test_route_with_origins_override_is_parsed():
     assert europe.origins == ["IAD", "BWI"]
 
 
-def test_require_cash_comparison_true_when_set():
-    config = load_watchlist(FIXTURE_PATH)
-    italy = next(r for r in config.routes if r.name == "DC → Italy")
-    assert italy.require_cash_comparison is True
-
-
-def test_require_cash_comparison_defaults_false_when_absent():
-    config = load_watchlist(FIXTURE_PATH)
-    europe = next(r for r in config.routes if r.name == "DC → Europe (broad)")
-    assert europe.require_cash_comparison is False
-
-
 def test_date_window_offsets_from_today():
     config = load_watchlist(FIXTURE_PATH)
     italy = next(r for r in config.routes if r.name == "DC → Italy")
@@ -188,3 +176,20 @@ def test_real_watchlist_thresholds_match_validated_values():
     # scoped to reachable programs + default, not an indiscriminate
     # find-replace across the whole cpp_floors dict.
     assert config.awards.cpp_floors.get("aadvantage") == 1.5
+
+
+def test_real_watchlist_europe_broad_route_has_no_origins_override():
+    """Regression: DC -> Europe (broad) used to override origins to
+    [IAD, BWI]. Removed 2026-07-19 -- a pre-flight cost check ahead of the
+    first real digest run found scripts/.dry_run_state.json holds ZERO
+    cached baselines for BWI-anything (never queried by anything, ever), so
+    a run including it would be fully cache-cold across all 8 destinations,
+    with SerpApi cost potentially doubling versus IAD alone. Deferred, not
+    abandoned -- see watchlist.yaml's comment on this route and
+    SESSION_HANDOFF.md. Targets the LIVE watchlist.yaml specifically (not
+    the fixture) to catch a regression back to re-adding BWI without that
+    same deliberate cost check."""
+    config = load_watchlist()  # real watchlist.yaml, not the fixture
+    europe = next(r for r in config.routes if r.name == "DC → Europe (broad)")
+    assert europe.origins is None  # falls back to the top-level list, no override
+    assert config.origins == ["IAD"]  # ...which is IAD-only, no BWI anywhere

@@ -55,12 +55,18 @@ def test_compute_effective_cpp_zero_miles_is_zero():
     assert compute_effective_cpp(comparable_cash_usd=500, taxes_fees_usd=0, miles=0) == 0.0
 
 
-def test_is_high_value_v1_0_fires_without_cash_data(saver_business_award, award_config):
-    # v1.0 has no cash provider wired up: cabin match alone fires (results
-    # are already saver-equivalent by construction -- no per-item flag).
+def test_is_high_value_skips_without_cash_data(saver_business_award, award_config):
+    """Regression: an earlier version fell back to firing on cabin-match
+    alone when comparable_cash_usd was None (no cash provider, a lookup
+    failure, or genuinely no data yet). That fallback direction was retired
+    -- a real safety issue found in an architecture review, since it meant
+    a cash-pipeline outage's failure mode was MORE alerts, not fewer, on a
+    system whose top priority is avoiding alert fatigue. No resolved cash
+    price must always skip, on every route, unconditionally -- there is no
+    per-route opt-out."""
     verdict = is_high_value(saver_business_award, award_config, {"business", "first"})
-    assert verdict.fire is True
-    assert "88,000" in verdict.headline
+    assert verdict.fire is False
+    assert verdict.reason == "cash data unavailable, skipping rather than firing blind"
 
 
 def test_is_high_value_skips_untracked_cabin(saver_business_award, award_config):
@@ -135,37 +141,6 @@ def test_is_high_value_skips_when_taxes_unknown(saver_business_award, award_conf
     )
     assert verdict.fire is False
     assert "taxes unknown" in verdict.reason
-
-
-def test_is_high_value_no_cash_data_falls_back_when_require_cash_comparison_false(saver_business_award, award_config):
-    # require_cash_comparison defaults to False -- must preserve the exact
-    # v1.0-style cabin-match-only fallback, unchanged.
-    verdict = is_high_value(saver_business_award, award_config, {"business", "first"}, comparable_cash_usd=None)
-    assert verdict.fire is True
-    assert verdict.reason == "saver-equivalent availability in a tracked cabin"
-
-
-def test_is_high_value_no_cash_data_skips_when_require_cash_comparison_true(saver_business_award, award_config):
-    verdict = is_high_value(
-        saver_business_award, award_config, {"business", "first"},
-        comparable_cash_usd=None, require_cash_comparison=True,
-    )
-    assert verdict.fire is False
-    assert verdict.reason == "no cash data available yet for CPP-gated route, skipping"
-
-
-def test_is_high_value_require_cash_comparison_true_still_gates_normally_once_cash_resolves(
-    saver_business_award, award_config
-):
-    # require_cash_comparison only changes the "no cash data at all" branch --
-    # once a real comparable_cash_usd exists, the normal CPP/trip-value gate
-    # applies exactly as it would with require_cash_comparison=False.
-    verdict = is_high_value(
-        saver_business_award, award_config, {"business", "first"},
-        comparable_cash_usd=5900, taxes_usd=180, require_cash_comparison=True,
-    )
-    assert verdict.fire is True
-    assert "cpp" in verdict.reason
 
 
 def test_is_high_value_uses_per_program_floor(award_config):

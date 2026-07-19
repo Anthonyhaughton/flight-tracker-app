@@ -59,19 +59,30 @@ class FakeSeatsAeroClient:
 
 
 class FakeCashFareProvider:
-    """Defaults to finding nothing (empty search results) every call, so
-    existing award-only tests get v1.0-equivalent behavior (no cash data,
-    comparable_cash_usd stays None) without each one having to care about
-    cash. Tests that DO care about cash pass fares_by_call explicitly."""
+    """Defaults to finding nothing (empty search results) every call. Since
+    the no-cash-data path always skips now (no cabin-match-alone fallback
+    -- see src/valuation.py's is_high_value), that default means "every
+    award skips" unless a test explicitly supplies data.
 
-    def __init__(self, fares_by_call: list[list[CashFare]] | None = None):
+    Tests that care about exact cash specifics (prices, call counts) pass
+    `fares_by_call` explicitly, indexed by call order. Tests that just need
+    every award to reliably clear the cash gate, without caring about exact
+    call counts or which weekly bucket/exact-date call is which (e.g. the
+    cap/dedup tests), pass `default_fare` instead -- it's returned for
+    every call beyond what `fares_by_call` explicitly covers, rather than
+    falling through to an empty (now skip-causing) result."""
+
+    def __init__(self, fares_by_call: list[list[CashFare]] | None = None, default_fare: CashFare | None = None):
         self.calls: list[tuple] = []
         self._fares_by_call = fares_by_call or []
+        self._default_fare = default_fare
 
     def search(self, origin, destinations, start, end, cabin) -> list[CashFare]:
         self.calls.append((origin, destinations, start, end, cabin))
         idx = len(self.calls) - 1
-        return self._fares_by_call[idx] if idx < len(self._fares_by_call) else []
+        if idx < len(self._fares_by_call):
+            return self._fares_by_call[idx]
+        return [self._default_fare] if self._default_fare is not None else []
 
     def close(self) -> None:
         pass
@@ -170,7 +181,7 @@ def test_poller_passes_real_taxes_to_first_valuation_call(monkeypatch):
 
     calls = []
 
-    def spy_is_high_value(award, config, wanted_cabins, comparable_cash_usd=None, taxes_usd=None, require_cash_comparison=False):
+    def spy_is_high_value(award, config, wanted_cabins, comparable_cash_usd=None, taxes_usd=None):
         calls.append(taxes_usd)
         return Verdict(True, "stub", "stub")
 
@@ -196,7 +207,10 @@ def test_poller_sends_alert_for_business_award():
     notifier = FakeNotifier()
     heartbeat = FakeHeartbeat()
 
-    alerts_sent = run(config, cash_provider=FakeCashFareProvider(), seats_client=seats_client, state=state, notifier=notifier, heartbeat=heartbeat)
+    alerts_sent = run(
+        config, cash_provider=FakeCashFareProvider(default_fare=make_fare(price_usd=5900.0)),
+        seats_client=seats_client, state=state, notifier=notifier, heartbeat=heartbeat,
+    )
 
     assert alerts_sent == 1
     assert len(notifier.sent) == 1
@@ -217,7 +231,10 @@ def test_poller_selects_matching_cabin_trip_not_first_trip():
     notifier = FakeNotifier()
     heartbeat = FakeHeartbeat()
 
-    run(config, cash_provider=FakeCashFareProvider(), seats_client=seats_client, state=state, notifier=notifier, heartbeat=heartbeat)
+    run(
+        config, cash_provider=FakeCashFareProvider(default_fare=make_fare(price_usd=5900.0)),
+        seats_client=seats_client, state=state, notifier=notifier, heartbeat=heartbeat,
+    )
 
     sent_trip = notifier.sent[0][2]
     assert sent_trip["Cabin"] == "business"
@@ -259,8 +276,18 @@ def test_poller_dedups_on_second_run_same_deal():
     notifier = FakeNotifier()
     heartbeat = FakeHeartbeat()
 
-    first_run = run(config, cash_provider=FakeCashFareProvider(), seats_client=FakeSeatsAeroClient([award]), state=state, notifier=notifier, heartbeat=heartbeat)
-    second_run = run(config, cash_provider=FakeCashFareProvider(), seats_client=FakeSeatsAeroClient([award]), state=state, notifier=notifier, heartbeat=heartbeat)
+    first_run = run(
+        config, cash_provider=FakeCashFareProvider(default_fare=make_fare(price_usd=5900.0)),
+        seats_client=FakeSeatsAeroClient([award]), state=state, notifier=notifier, heartbeat=heartbeat,
+    )
+    # Second run's provider is never actually called: the baseline seeded by
+    # the first run is still fresh (same real time, cash_baseline_minutes
+    # window), and this is the SAME award -- dedup catches it before either
+    # a fresh baseline lookup or an exact-date confirm would be attempted.
+    second_run = run(
+        config, cash_provider=FakeCashFareProvider(), seats_client=FakeSeatsAeroClient([award]), state=state,
+        notifier=notifier, heartbeat=heartbeat,
+    )
 
     assert first_run == 1
     assert second_run == 0
@@ -275,10 +302,20 @@ def test_poller_re_alerts_when_price_crosses_lower_bucket():
     heartbeat = FakeHeartbeat()
 
     first = make_award(miles=88000)
-    run(config, cash_provider=FakeCashFareProvider(), seats_client=FakeSeatsAeroClient([first]), state=state, notifier=notifier, heartbeat=heartbeat)
+    run(
+        config, cash_provider=FakeCashFareProvider(default_fare=make_fare(price_usd=5900.0)),
+        seats_client=FakeSeatsAeroClient([first]), state=state, notifier=notifier, heartbeat=heartbeat,
+    )
 
     better = make_award(miles=60000, availability_id="aeroplan-iad-fco-2026-05-14-v2")
-    second_alerts = run(config, cash_provider=FakeCashFareProvider(), seats_client=FakeSeatsAeroClient([better]), state=state, notifier=notifier, heartbeat=heartbeat)
+    # Same route/cabin/date -> same baseline_key -- the weekly lookup hits
+    # cache (no call), but this is a DIFFERENT award_key (different miles
+    # bucket), so it's not deduped and DOES reach the exact-date confirm,
+    # which needs its own real fare.
+    second_alerts = run(
+        config, cash_provider=FakeCashFareProvider(default_fare=make_fare(price_usd=5900.0)),
+        seats_client=FakeSeatsAeroClient([better]), state=state, notifier=notifier, heartbeat=heartbeat,
+    )
 
     assert second_alerts == 1
     assert len(notifier.sent) == 2
@@ -311,7 +348,10 @@ def test_run_enforces_max_alerts_per_run_cap():
     notifier = FakeNotifier()
     heartbeat = FakeHeartbeat()
 
-    alerts_sent = run(config, cash_provider=FakeCashFareProvider(), seats_client=seats_client, state=state, notifier=notifier, heartbeat=heartbeat)
+    alerts_sent = run(
+        config, cash_provider=FakeCashFareProvider(default_fare=make_fare(price_usd=5900.0)),
+        seats_client=seats_client, state=state, notifier=notifier, heartbeat=heartbeat,
+    )
 
     assert alerts_sent == 3
     assert len(notifier.sent) == 3
@@ -333,15 +373,18 @@ def test_poll_route_counts_duplicate_and_capped_skips_separately():
     state = InMemoryStateStore()
     notifier = FakeNotifier()
 
+    cash_provider = FakeCashFareProvider(default_fare=make_fare(price_usd=5900.0))
     stats = poll_route(
-        FakeSeatsAeroClient(awards), config.origins, route, config, state, notifier, max_alerts_per_run=3
+        FakeSeatsAeroClient(awards), config.origins, route, config, state, notifier,
+        cash_provider=cash_provider, max_alerts_per_run=3,
     )
     assert stats.alerts_sent == 3
     assert stats.skipped_capped == 2
     assert stats.skipped_duplicate == 0
 
     stats2 = poll_route(
-        FakeSeatsAeroClient(awards), config.origins, route, config, state, notifier, max_alerts_per_run=3
+        FakeSeatsAeroClient(awards), config.origins, route, config, state, notifier,
+        cash_provider=cash_provider, max_alerts_per_run=3,
     )
     assert stats2.skipped_duplicate == 3
     assert stats2.alerts_sent == 2
@@ -362,7 +405,10 @@ def test_run_logs_cap_and_duplicate_counts_separately(caplog):
     heartbeat = FakeHeartbeat()
 
     with caplog.at_level(logging.INFO, logger="poller"):
-        run(config, cash_provider=FakeCashFareProvider(), seats_client=seats_client, state=state, notifier=notifier, heartbeat=heartbeat)
+        run(
+            config, cash_provider=FakeCashFareProvider(default_fare=make_fare(price_usd=5900.0)),
+            seats_client=seats_client, state=state, notifier=notifier, heartbeat=heartbeat,
+        )
 
     summary = next(r.getMessage() for r in caplog.records if "poll complete" in r.getMessage())
     assert "3 candidate(s) evaluated" in summary
@@ -482,12 +528,15 @@ def test_poller_sends_using_exact_date_confirmed_price_not_weekly_bucketed_price
     assert "$1,700" not in sent_verdict.headline
 
 
-def test_poller_skips_confirm_and_uses_none_when_no_cash_provider_data_at_all():
+def test_poller_skips_when_no_cash_provider_data_at_all():
     """When there's no real cash data to begin with (e.g. an empty
-    provider, matching v1.0's no-cash-provider behavior), the exact-date
-    confirm step must not run at all -- there's nothing to confirm, and
-    running it anyway would spend a wasted call and could wrongly reject an
-    award that's only ever meant to fire on cabin-match-alone semantics."""
+    provider), the award must be SKIPPED, not fired on cabin-match-alone --
+    an earlier version fell back to firing here (v1.0-style, "results are
+    already saver-equivalent by construction"), but that fallback direction
+    was retired as a real safety issue: a cash-pipeline outage's failure
+    mode must never be MORE alerts. The exact-date confirm step correctly
+    never runs either -- there's nothing to confirm, and the award is
+    already rejected before reaching that point."""
     config = make_config()
     award = make_award()
     seats_client = FakeSeatsAeroClient([award])
@@ -501,9 +550,12 @@ def test_poller_skips_confirm_and_uses_none_when_no_cash_provider_data_at_all():
         heartbeat=heartbeat,
     )
 
-    assert alerts_sent == 1  # fires on cabin-match-alone, same as v1.0
-    # Only the weekly-bucket lookup call happens -- no second (confirm) call.
+    assert alerts_sent == 0
+    assert notifier.sent == []
+    # Only the weekly-bucket lookup call happens -- no second (confirm) call,
+    # since the award never reaches Get Trips.
     assert len(cash_provider.calls) == 1
+    assert seats_client.get_trips_calls == []
 
 
 def test_poller_never_fires_cash_drop_on_first_observation():
@@ -749,11 +801,16 @@ class RaisingCashFareProvider:
         pass
 
 
-def test_poller_continues_award_only_when_cash_provider_raises():
+def test_poller_skips_award_when_cash_provider_raises(caplog):
     """Per flight-cash-price-monitor: 'a provider hiccup should log and
-    skip, not crash the whole poll run.' A cash lookup failure must degrade
-    to v1.0's award-only behavior (comparable_cash_usd=None), not blow up
-    the run or block the award from firing on cabin match alone."""
+    skip, not crash the whole poll run' -- the run itself must not blow up.
+    But a cash lookup failure must NOT degrade to v1.0's award-only
+    fallback (comparable_cash_usd=None -> fire on cabin match alone)
+    either: that fallback direction was retired as a real safety issue,
+    since it meant a cash-provider outage's failure mode was MORE alerts,
+    not fewer -- exactly backwards for a system whose top priority is
+    avoiding alert fatigue. A cash-provider failure must now result in
+    ZERO alerts (skip + a clear log line), not a fallback burst."""
     config = make_config()
     award = make_award()
     seats_client = FakeSeatsAeroClient([award])
@@ -761,14 +818,19 @@ def test_poller_continues_award_only_when_cash_provider_raises():
     notifier = FakeNotifier()
     heartbeat = FakeHeartbeat()
 
-    alerts_sent = run(
-        config, cash_provider=RaisingCashFareProvider(), seats_client=seats_client, state=state,
-        notifier=notifier, heartbeat=heartbeat,
-    )
+    with caplog.at_level(logging.WARNING, logger="poller"):
+        alerts_sent = run(
+            config, cash_provider=RaisingCashFareProvider(), seats_client=seats_client, state=state,
+            notifier=notifier, heartbeat=heartbeat,
+        )
 
-    assert alerts_sent == 1
-    assert notifier.sent[0][0].origin == "IAD"
+    assert alerts_sent == 0
+    assert notifier.sent == []
     assert notifier.cash_sent == []
+    assert seats_client.get_trips_calls == []  # never even reached Get Trips
+
+    warning = next(r.getMessage() for r in caplog.records if "cash baseline lookup failed" in r.getMessage())
+    assert "skipping rather than firing blind" in warning
 
 
 def test_poller_skips_when_get_trips_shows_space_gone():
@@ -819,7 +881,7 @@ def test_poller_skips_alert_when_real_taxes_fail_recheck(monkeypatch):
     import src.poller as poller_module
     from src.valuation import Verdict
 
-    def fake_is_high_value(award, config, wanted_cabins, comparable_cash_usd=None, taxes_usd=None, require_cash_comparison=False):
+    def fake_is_high_value(award, config, wanted_cabins, comparable_cash_usd=None, taxes_usd=None):
         if taxes_usd and taxes_usd > 0:
             return Verdict(False, "real taxes push trip value below floor", "")
         return Verdict(True, "optimistic estimate", "estimate")
@@ -986,7 +1048,7 @@ def test_run_raises_clear_error_when_table_name_env_vars_missing(monkeypatch):
         run(config, cash_provider=FakeCashFareProvider(), seats_client=FakeSeatsAeroClient([]), notifier=FakeNotifier(), heartbeat=FakeHeartbeat())
 
 
-# --- eligible_programs prefilter, per-route origins override, require_cash_comparison ---
+# --- eligible_programs prefilter, per-route origins override, no-cash-data skip ---
 
 
 def test_poller_skips_ineligible_program_before_any_provider_call():
@@ -1023,8 +1085,8 @@ def test_poller_fires_eligible_program_when_eligible_programs_set():
     heartbeat = FakeHeartbeat()
 
     alerts_sent = run(
-        config, cash_provider=FakeCashFareProvider(), seats_client=seats_client, state=state, notifier=notifier,
-        heartbeat=heartbeat,
+        config, cash_provider=FakeCashFareProvider(default_fare=make_fare(price_usd=5900.0)),
+        seats_client=seats_client, state=state, notifier=notifier, heartbeat=heartbeat,
     )
 
     assert alerts_sent == 1
@@ -1044,8 +1106,8 @@ def test_poller_uses_route_origins_override_not_top_level():
     heartbeat = FakeHeartbeat()
 
     alerts_sent = run(
-        config, cash_provider=FakeCashFareProvider(), seats_client=seats_client, state=state, notifier=notifier,
-        heartbeat=heartbeat,
+        config, cash_provider=FakeCashFareProvider(default_fare=make_fare(price_usd=5900.0)),
+        seats_client=seats_client, state=state, notifier=notifier, heartbeat=heartbeat,
     )
 
     assert seats_client.cached_search_origins == ["BWI"]  # route override used, not config.origins ("IAD")
@@ -1065,36 +1127,15 @@ def test_poller_route_without_origins_override_falls_back_to_top_level():
     assert seats_client.cached_search_origins == ["IAD"]
 
 
-def test_poller_require_cash_comparison_true_skips_when_no_cash_data_at_all():
-    """Contrast with test_poller_skips_confirm_and_uses_none_when_no_cash_provider_data_at_all
-    (require_cash_comparison defaults False there -> fires on cabin-match-alone):
-    with require_cash_comparison=True on the route, the exact same
-    no-cash-data situation must skip instead."""
+def test_poller_no_cash_data_skip_applies_unconditionally_to_every_route():
+    """There is no route-level opt-out of the no-cash-data skip anymore --
+    it used to be conditional on a per-route require_cash_comparison flag
+    (removed; see src/valuation.py's is_high_value module docstring). This
+    uses the default route config, with no special flag of any kind, and
+    confirms the skip still applies -- the SAME assertion as
+    test_poller_skips_when_no_cash_provider_data_at_all above, restated
+    here specifically to prove universality, not conditionality."""
     config = make_config()
-    gated_route = dataclasses.replace(config.routes[0], require_cash_comparison=True)
-    config = dataclasses.replace(config, routes=[gated_route])
-    award = make_award()
-    seats_client = FakeSeatsAeroClient([award])
-    cash_provider = FakeCashFareProvider()  # always returns [] -- no cash data anywhere
-    state = InMemoryStateStore()
-    notifier = FakeNotifier()
-    heartbeat = FakeHeartbeat()
-
-    alerts_sent = run(
-        config, cash_provider=cash_provider, seats_client=seats_client, state=state, notifier=notifier,
-        heartbeat=heartbeat,
-    )
-
-    assert alerts_sent == 0
-    assert notifier.sent == []
-
-
-def test_poller_require_cash_comparison_false_still_fires_without_cash_data():
-    """The default (require_cash_comparison unset -> False) must keep
-    preserving the resilient v1.0-style fallback exactly as before -- this is
-    the same scenario as the test above with the gate off."""
-    config = make_config()
-    assert config.routes[0].require_cash_comparison is False
     award = make_award()
     seats_client = FakeSeatsAeroClient([award])
     state = InMemoryStateStore()
@@ -1106,29 +1147,8 @@ def test_poller_require_cash_comparison_false_still_fires_without_cash_data():
         heartbeat=heartbeat,
     )
 
-    assert alerts_sent == 1
-
-
-def test_poller_require_cash_comparison_true_still_fires_when_cash_data_clears_gate():
-    """require_cash_comparison only changes the "no cash data at all" branch
-    -- once real cash data resolves and clears the CPP gate, the route must
-    still fire normally."""
-    config = make_config()
-    gated_route = dataclasses.replace(config.routes[0], require_cash_comparison=True)
-    config = dataclasses.replace(config, routes=[gated_route])
-    award = make_award()
-    seats_client = FakeSeatsAeroClient([award])
-    cash_provider = FakeCashFareProvider([[make_fare(price_usd=5900.0)], [make_fare(price_usd=5900.0)]])
-    state = InMemoryStateStore()
-    notifier = FakeNotifier()
-    heartbeat = FakeHeartbeat()
-
-    alerts_sent = run(
-        config, cash_provider=cash_provider, seats_client=seats_client, state=state, notifier=notifier,
-        heartbeat=heartbeat,
-    )
-
-    assert alerts_sent == 1
+    assert alerts_sent == 0
+    assert notifier.sent == []
 
 
 def test_run_does_not_close_an_injected_notifier():
@@ -1140,3 +1160,96 @@ def test_run_does_not_close_an_injected_notifier():
     run(config, cash_provider=FakeCashFareProvider(), seats_client=FakeSeatsAeroClient([]), state=InMemoryStateStore(), notifier=notifier, heartbeat=FakeHeartbeat())
 
     assert notifier.closed is False
+
+
+# --- structural drift-proofing: poll_route() and scripts/dry_run.py must
+# call the ONE shared evaluate_candidate(), never a second copy of it ---
+
+
+# --- lambda_handler mode dispatch: {"mode": "digest"} routes to run_digest(),
+# every other event preserves the pre-digest real-time path exactly ---
+
+
+def test_lambda_handler_dispatches_to_run_digest_on_digest_mode(monkeypatch):
+    import src.poller as poller_module
+    from src.digest import DigestResult
+
+    calls = {"run": 0, "run_digest": 0}
+
+    def fake_run_digest(*args, **kwargs):
+        calls["run_digest"] += 1
+        return DigestResult(cash_rank=[], cpp_rank=[], candidates_evaluated=3, candidates_ranked=1)
+
+    def fake_run(*args, **kwargs):
+        calls["run"] += 1
+        return 0
+
+    monkeypatch.setattr(poller_module, "run_digest", fake_run_digest)
+    monkeypatch.setattr(poller_module, "run", fake_run)
+
+    response = poller_module.lambda_handler({"mode": "digest"}, None)
+
+    assert calls == {"run": 0, "run_digest": 1}  # the real-time path was never touched
+    assert response == {"statusCode": 200, "mode": "digest", "candidatesEvaluated": 3, "candidatesRanked": 1}
+
+
+def test_lambda_handler_default_path_is_byte_for_byte_unchanged(monkeypatch):
+    """Regression guard: adding the digest dispatch branch must not alter
+    lambda_handler's existing return shape or behavior for every event that
+    ISN'T {"mode": "digest"} -- a missing event, an empty dict, and the
+    real-time schedule's actual (non-digest) payload all must produce the
+    exact same {"statusCode": 200, "alertsSent": N} response run() always
+    produced, with run_digest() never even constructed."""
+    import src.poller as poller_module
+    from src.digest import DigestResult
+
+    calls = {"run": 0, "run_digest": 0}
+
+    def fake_run_digest(*args, **kwargs):
+        calls["run_digest"] += 1
+        return DigestResult(cash_rank=[], cpp_rank=[], candidates_evaluated=0, candidates_ranked=0)
+
+    def fake_run(*args, **kwargs):
+        calls["run"] += 1
+        return 5
+
+    monkeypatch.setattr(poller_module, "run_digest", fake_run_digest)
+    monkeypatch.setattr(poller_module, "run", fake_run)
+
+    for event in (None, {}, {"mode": "realtime"}, {"some": "other-payload"}):
+        calls["run"] = calls["run_digest"] = 0
+        response = poller_module.lambda_handler(event, None)
+        assert response == {"statusCode": 200, "alertsSent": 5}
+        assert calls == {"run": 1, "run_digest": 0}
+
+
+def test_dry_run_script_calls_the_same_evaluate_candidate_object_as_poll_route():
+    """This is an object-identity check, not a behavioral one on purpose.
+    A future edit could reintroduce a second, textually-similar copy of
+    evaluate_candidate() inside scripts/dry_run.py (e.g. someone "just
+    inlines a tweak" for a one-off test) that still passes every behavioral
+    test in this file, since it would still produce plausible-looking
+    output -- exactly the failure mode that let this script drift out of
+    sync with production twice before (a missed trips[0] regression, and
+    later missing the entire v1.1 cash wiring). Asserting object identity
+    (`is`, not `==`) fails loudly the moment scripts/dry_run.py stops
+    calling src.poller.evaluate_candidate itself, regardless of how
+    similar a replacement looks."""
+    import importlib.util
+    from pathlib import Path
+
+    import src.poller as poller_module
+
+    dry_run_path = Path(__file__).resolve().parent.parent / "scripts" / "dry_run.py"
+    spec = importlib.util.spec_from_file_location("dry_run_under_test", dry_run_path)
+    dry_run_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(dry_run_module)  # runs module-level code only -- main() is __name__-guarded, never called
+
+    assert dry_run_module.evaluate_candidate is poller_module.evaluate_candidate
+    # Same check for the other two pieces of the shared contract dry_run.py
+    # depends on -- PollStats (the mutable aggregation object) and
+    # TripFetchResult (the fetch_trip callback's return type) -- a
+    # redefinition of either, even an identical-looking one, would silently
+    # break the shared function's actual contract.
+    assert dry_run_module.PollStats is poller_module.PollStats
+    assert dry_run_module.TripFetchResult is poller_module.TripFetchResult

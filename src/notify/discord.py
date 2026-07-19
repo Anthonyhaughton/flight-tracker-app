@@ -18,6 +18,7 @@ import time
 
 import httpx
 
+from src.digest import DigestEntry, DigestResult
 from src.providers.cash.base import CashFare
 from src.providers.seats_aero import AwardAvailability, parse_trip_taxes_usd
 from src.state import Baseline
@@ -36,6 +37,7 @@ MAX_EMBEDS = 10
 
 COLOR_GOOD_DEAL = 0x2ECC71  # green -- award redemption alerts
 COLOR_CASH_DEAL = 0xF1C40F  # gold -- standalone cash price-drop alerts, visually distinct from award alerts
+COLOR_DIGEST = 0x3498DB     # blue -- weekly digest, distinct from both real-time alert colors above
 
 
 class DiscordError(RuntimeError):
@@ -63,6 +65,9 @@ class DiscordNotifier:
     def send_cash_alert(self, fare: CashFare, verdict: Verdict, baseline: Baseline | None) -> None:
         embed = format_cash_embed(fare, verdict, baseline)
         self._send_embeds([embed])
+
+    def send_digest(self, result: DigestResult) -> None:
+        self._send_embeds(format_digest_embeds(result))
 
     def close(self) -> None:
         self._client.close()
@@ -239,3 +244,67 @@ def format_cash_embed(fare: CashFare, verdict: Verdict, baseline: Baseline | Non
     if fare.deep_link:
         embed["url"] = fare.deep_link
     return embed
+
+
+def _format_digest_entry_field(entry: DigestEntry) -> dict:
+    program_label = entry.award.program.replace("_", " ").title()
+    match_note = " -- would clear real-time bar" if entry.cleared_real_time_bar else ""
+    name = f"{entry.award.origin} -> {entry.award.destination} ({entry.award.date.isoformat()})"
+    value = (
+        f"{program_label} - {entry.award.miles:,} mi + ${entry.taxes_usd:,.0f} taxes\n"
+        f"${entry.comparable_cash_usd:,.0f} cash | {entry.cpp:.1f}¢/pt | ${entry.trip_value_usd:,.0f} trip value"
+        f"{match_note}"
+    )
+    return {"name": name, "value": value, "inline": False}
+
+
+def format_digest_embeds(result: DigestResult) -> list[dict]:
+    """Two embeds -- Top Cash Value and Top CPP -- sent together as ONE
+    message's embed set (not 10 separate alert-style messages). Always
+    produces something: an honest "no availability" embed when both rankings
+    are empty (result.cash_rank and result.cpp_rank are simultaneously empty
+    or non-empty -- see DigestResult's docstring), and a "nothing cleared the
+    real-time bar" footer, naming the closest miss, when the digest has
+    entries but none of them would have fired a real alert. This is the
+    actual fix for real-time silence being indistinguishable from a dead
+    pipeline -- see deal-valuation."""
+    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+    if not result.cash_rank and not result.cpp_rank:
+        return [
+            {
+                "title": "Weekly Deal Digest",
+                "color": COLOR_DIGEST,
+                "description": (
+                    f"No award availability found this week "
+                    f"({result.candidates_evaluated} candidate(s) evaluated across all active routes)."
+                ),
+                "timestamp": now,
+            }
+        ]
+
+    cleared_any = any(e.cleared_real_time_bar for e in (*result.cash_rank, *result.cpp_rank))
+
+    cash_embed: dict = {
+        "title": "Weekly Digest - Top Cash Value",
+        "color": COLOR_DIGEST,
+        "fields": [_format_digest_entry_field(e) for e in result.cash_rank],
+        "footer": {"text": f"{result.candidates_ranked} candidate(s) ranked this week"},
+        "timestamp": now,
+    }
+    cpp_embed: dict = {
+        "title": "Weekly Digest - Top CPP",
+        "color": COLOR_DIGEST,
+        "fields": [_format_digest_entry_field(e) for e in result.cpp_rank],
+        "timestamp": now,
+    }
+    if not cleared_any:
+        closest = result.cpp_rank[0]
+        program_label = closest.award.program.replace("_", " ").title()
+        cpp_embed["footer"] = {
+            "text": (
+                f"Nothing cleared the real-time bar this week -- closest was {closest.cpp:.1f}cpp on "
+                f"{program_label} (floor {closest.real_time_cpp_floor:.1f}cpp)."
+            )
+        }
+    return [cash_embed, cpp_embed]

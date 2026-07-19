@@ -41,12 +41,6 @@ class RouteConfig:
     # own set of departure airports, so this only exists for the routes that
     # actually differ (e.g. a route that excludes DCA).
     origins: list[str] | None = None
-    # When True, a candidate on this route with no resolved cash price (no
-    # provider wired up, SerpApi found nothing, or the provider errored)
-    # must NOT fall back to v1.0's cabin-match-only firing -- it skips
-    # instead. False (the default) preserves that resilient fallback exactly
-    # as it always has. See src/valuation.py's is_high_value.
-    require_cash_comparison: bool = False
 
 
 @dataclass(frozen=True)
@@ -122,7 +116,6 @@ def load_watchlist(path: str | Path = DEFAULT_WATCHLIST_PATH) -> WatchlistConfig
             date_window=DateWindow(**r["date_window"]),
             active=r.get("active", True),
             origins=r.get("origins"),
-            require_cash_comparison=r.get("require_cash_comparison", False),
         )
         for r in raw["routes"]
     ]

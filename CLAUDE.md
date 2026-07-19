@@ -129,12 +129,17 @@ flight-deal-agent/
 ## What counts as "high value"
 
 Defined in full in the `deal-valuation` skill. In one line: an award is worth alerting on
-when it is **saver-priced**, in a **cabin the owner cares about** (business/first for
-long-haul), and its **effective cents-per-point beats the owner's floor for that program**
-— or when a cash fare drops meaningfully below its tracked baseline. Availability alone is
-never the trigger. The cash price behind that CPP math is itself two-stage (a cheap,
-cached weekly estimate decides candidacy; one precise real call confirms the exact date
-before a real alert sends) — see `deal-valuation`.
+when it is **saver-priced**, in a **cabin the owner cares about** (a `watchlist.yaml`
+per-route config choice — both active routes currently watch **economy**, not the original
+business/first; see `deal-valuation`'s real validated economy-cabin calibration), its
+**program is one the owner can actually book through** (Amex MR / Chase UR transfer
+partners — `eligible_programs`, see `deal-valuation`), and its **effective cents-per-point
+beats the owner's floor for that program** — or when a cash fare drops meaningfully below
+its tracked baseline. Availability alone is never the trigger. The cash price behind that
+CPP math is itself two-stage (a cheap, cached weekly estimate decides candidacy; one precise
+real call confirms the exact date before a real alert sends) — see `deal-valuation`. A
+candidate with no resolved cash price always skips — never falls back to firing on cabin
+match alone, on any route, no exceptions (a real safety fix — see `deal-valuation`).
 
 ## Build phases (ship v1 before touching the hard part)
 
@@ -147,31 +152,87 @@ all the anti-bot pain lives.
   `telegram-alerting`). Verified via a real manual Lambda invoke: real seats.aero data →
   real valuation → a real Discord alert delivered. Deployed via Terraform using a two-phase
   apply (schedule created disabled, verified with one manual invoke, then enabled — see
-  `aws-serverless-deploy`).
-- **v1.1 — cash + real valuation. ✅ PRODUCTION-VERIFIED end-to-end against live data.**
-  `CashFareProvider` (SerpApi) implemented against the live API reference; cash baselines
-  (trailing-min + EMA, ISO-week-bucketed to bound provider call volume) with a real
-  exact-date confirm step for finalists before a real alert sends; real effective-CPP
-  gating (`comparable_cash_usd` is no longer always `None`); a second, independent
-  cash-price-drop trigger. 150+ tests pass, all mocked, zero real network. Live-verified via
-  `scripts/dry_run.py` in both directions: a real run sent a real Discord award alert with a
+  `aws-serverless-deploy`). **This is still the only code actually running in production —
+  see "Current deploy status" below.**
+- **v1.1 — cash + real valuation. ✅ BUILT, TESTED, AND LOCALLY LIVE-VERIFIED. ⚠️ NEVER
+  DEPLOYED.** `CashFareProvider` (SerpApi) implemented against the live API reference; cash
+  baselines (trailing-min + EMA, ISO-week-bucketed to bound provider call volume) with a real
+  exact-date confirm step for finalists before a real alert sends; real effective-CPP gating
+  (`comparable_cash_usd` is no longer always `None`); a second, independent cash-price-drop
+  trigger. 150+ tests pass, all mocked, zero real network. Live-verified via
+  `scripts/dry_run.py` (NOT the deployed Lambda — dry_run.py uses a local JSON state file,
+  completely separate from the real DynamoDB tables, see `aws-serverless-deploy`'s
+  live-testing lessons) in both directions: a real run sent a real Discord award alert with a
   real confirmed price/CPP in the footer (not the v1.0 "no cash comparison yet" placeholder);
   a follow-up run with `cpp_floors` deliberately inflated to an unreachable value confirmed
-  the real CPP gate correctly rejects — 10/10 real candidates skipped with the expected
-  `"X.Xcpp below PROGRAM floor"` reason, matching the mocked suite's format exactly. Dedup
-  confirmed to record state only on an actual send, never on a valuation-rejected candidate.
-  The cash-drop trigger correctly stayed silent on cold-start baselines (seeds silently,
-  never alerts on first observation); a live warm-baseline drop firing for real is still
-  unobserved, but is expected to need multiple runs over time to occur naturally and is not a
-  blocker for calling v1.1 closed.
-- **v1.2 — controls.** Inline-keyboard mute/snooze, `watchlist.yaml` fully drives routes,
-  heartbeat alarm.
+  the real CPP gate correctly rejects. Dedup confirmed to record state only on an actual
+  send, never on a valuation-rejected candidate. **"Production-verified" in earlier revisions
+  of this file meant "verified locally against live APIs," not "deployed" — that wording was
+  corrected here because it's easy to misread as a deploy claim.**
+- **v1.1.1 — reward-transfer filtering, economy pivot, real threshold calibration,
+  fallback-direction fix, shared-logic refactor. ✅ BUILT, TESTED, LOCALLY LIVE-VERIFIED.
+  ⚠️ NEVER DEPLOYED.** Everything in this phase is real, working, and has never touched the
+  deployed Lambda:
+  - `eligible_programs` allow-list (Amex MR / Chase UR transfer partners, cross-referenced
+    against live — not documented, see `seats-aero-integration` — seats.aero source keys).
+  - Both active routes switched from business/first to **economy**.
+  - `cpp_floor`/`min_trip_value_usd` recalibrated to 2.0/$250 against real economy data (see
+    `deal-valuation` for the full validated numbers, the Virgin Atlantic finding, and the
+    Qantas structurally-negative-value finding).
+  - The cash-outage fallback direction was fixed: `require_cash_comparison` (a per-route
+    opt-out) was **removed entirely** — no resolved cash price now unconditionally skips, on
+    every route, no exceptions (see `deal-valuation`).
+  - `poll_route()`'s and `scripts/dry_run.py`'s per-candidate logic was unified into one
+    shared `evaluate_candidate()` function, with an object-identity test preventing future
+    drift (see the new `avoiding-duplicate-implementations` skill).
+  - A `terraform plan` has been reviewed (source-code-hash-only diff, confirmed clean) but
+    **never applied**.
+- **v1.2 — the weekly digest. ✅ BUILT AND TESTED (mocked only). ⚠️ NOT YET LIVE-VERIFIED.
+  ⚠️ NEVER DEPLOYED.** Same status tier v1.1.1 passed through before its own live
+  verification — see `deal-valuation` for the full implementation detail. `src/digest.py`'s
+  `build_weekly_digest()`: for every active route, real Cached Search → `eligible_programs`/
+  cabin prefilter → CPP/trip-value computed for every prefilter-passing candidate (not just
+  gate-passers) off the cheap weekly-bucketed cash estimate → two independent top-5 rankings
+  (cash-value, CPP) → exactly one real exact-date cash-confirm call per DISTINCT finalist
+  across the union of both lists (deduped, never per-list) → always produces a digest, even
+  an honestly empty one. Deliberately its OWN orchestration, not a call into
+  `evaluate_candidate()` — a "shared lower layer, different upper orchestration" case (see
+  `avoiding-duplicate-implementations`): dedup/the per-run cap/single-alert-notify don't apply
+  to a digest that ranks everything and sends one aggregate message. Wired into
+  `lambda_handler` via a distinct `{"mode": "digest"}` event payload (every other event is
+  provably behavior-preserving — see `test_lambda_handler_default_path_is_byte_for_byte_unchanged`)
+  and into `scripts/dry_run.py` via `--mode digest`. 18 new tests, all mocked, full suite
+  green. **Not yet run against real live data** — `--mode digest` has only been smoke-tested
+  with a fake key (confirmed it reaches a real seats.aero call and fails loudly on auth,
+  proving the wiring, not the ranking output). A real `scripts/dry_run.py --mode digest` run
+  against live seats.aero/SerpApi/Discord is the next concrete step, mirroring how v1.1 was
+  live-verified before v1.1.1 was ever considered for deploy — see `SESSION_HANDOFF.md`. No
+  Terraform/infra work has been done for this phase at all yet (the second EventBridge
+  schedule doesn't exist yet, even in an unreviewed plan) — that's a separate, later step
+  after live verification, not started.
+- **v1.3 — further controls.** Inline-keyboard mute/snooze, heartbeat alarm tuning.
 - **v2 — breadth.** "Anywhere in Europe" inspiration search, more programs, mistake-fare
   detection.
 
-v1.1 is production-verified: `scripts/dry_run.py` has delivered a real, correctly
-cash-gated award alert to the owner's phone, and a separate run confirmed the real CPP gate
-correctly rejects real candidates that fail the floor.
+## Current deploy status (read this before assuming anything is live)
+
+**The deployed Lambda is still running pre-v1.1 code** — award-only, business/first cabin,
+no `eligible_programs` filter, no economy support, the original 1.3–1.5cpp/$1,500 thresholds,
+and the old permissive cash-outage fallback (now known to be a real safety issue — see
+`deal-valuation`). None of v1.1 or v1.1.1 above is live. The EventBridge schedule has
+**never been enabled** at any point in this project's history (`schedule_enabled` has been
+`false` since the very first deploy) — the Lambda has never fired on its own schedule, only
+via manual invokes during v1.0 verification.
+
+Closing this gap requires two more deliberate, reviewed steps, mirroring the v1.0 two-phase
+pattern: apply the already-reviewed Terraform plan (ships the new code, schedule stays off),
+then a second apply flipping `schedule_enabled` to `true`.
+
+**One more real gap inside the current config itself:** `watchlist.yaml`'s real
+`DC → Europe (broad)` route sets `origins: [IAD, BWI]` — but only `IAD` has ever actually been
+queried by anything (real API calls or local dry runs). `BWI` is configured and would be
+included the moment this deploys, but its real behavior (does it surface different programs?
+different density?) is completely unverified.
 
 ## Skill index
 
@@ -181,8 +242,9 @@ correctly rejects real candidates that fail the floor.
 | Fetch cash fares behind a swappable provider interface | `flight-cash-price-monitor` |
 | Decide if a deal is "high value"; CPP math; two-stage cash confirm; dedup + alert-cap design | `deal-valuation` |
 | Send/format Discord (default) or Telegram alerts, MarkdownV2 escaping, buttons | `telegram-alerting` |
-| Terraform, Lambda, EventBridge, DynamoDB, secrets, CI/OIDC, packaging gotchas | `aws-serverless-deploy` |
+| Terraform, Lambda, EventBridge, DynamoDB, secrets, CI/OIDC, packaging gotchas, live-testing cost/verification lessons | `aws-serverless-deploy` |
 | Handling API keys/webhooks safely: log-leak patterns, cold-start resolution, local/deployed secret sync | `secrets-hygiene` |
+| A second entrypoint (dry-run script, alternate CLI) needs production's core logic without reimplementing it | `avoiding-duplicate-implementations` |
 
 When in doubt about an external API's exact current schema, **fetch the live docs** rather
 than trusting memory — these providers change endpoints and pricing.

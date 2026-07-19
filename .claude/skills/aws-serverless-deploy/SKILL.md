@@ -95,6 +95,47 @@ confirmed run") for that first verified invoke specifically, and with the
 `max_alerts_per_run` cap (`deal-valuation`) as defense in depth — the two-phase apply
 prevents an *automatic* flood; the cap prevents a flood on a *manual* invoke too.
 
+## Live-testing operational lessons (real incidents, not hypotheticals)
+
+Three separate real incidents during `scripts/dry_run.py`-based live verification, all with
+the same shape: **trust what you can actually verify, not a status or an estimate.**
+
+**1. Local dry-run state never validates production's real cold-cache cost.**
+`scripts/dry_run.py` persists its own dedup/baseline state to a local JSON file
+(`scripts/.dry_run_state.json`) — completely separate from the real DynamoDB tables the
+deployed Lambda uses. Running the script repeatedly builds up a *locally* warm cache (recent
+weekly-baseline lookups served from that JSON file, no new SerpApi calls), which is genuinely
+useful for iterating cheaply during testing — but it means local testing **never exercises
+what the first real production run will actually cost**, since the DynamoDB baselines table
+starts empty regardless of how warm the local JSON cache is. When estimating the real API
+call cost of a first production verification after a wide config change (a new/widened route,
+a new cabin, a new destination), **assume a fully cold cache** — extrapolating from local
+dry-run numbers will systematically understate the real first-run cost.
+
+**2. An interrupted or rejected tool call can still have executed real side effects before the
+interrupt landed.** A tool call that comes back as "rejected" or "interrupted" is not proof
+that nothing happened — a long-running real API operation can be well underway, with real
+calls already sent and real state already written, before an interrupt signal actually stops
+it. This was confirmed directly: an "interrupted" dry-run invocation had, in fact, already
+completed 8 real seats.aero Cached Search calls and 30 real SerpApi weekly-baseline calls,
+fully persisted to the local state file, by the time the interrupt was observed. **Always
+verify actual state after an interrupted call** — provider dashboards, cache file
+timestamps, rate-limit headers (`X-RateLimit-Remaining`), dedup/baseline state contents —
+rather than assuming "interrupted" means "nothing happened." Re-running the same operation
+without checking first risks double-spending real quota, or missing that some of it already
+landed.
+
+**3. Self-reported running cost tallies drift from real billing over a long session — verify
+at the provider's dashboard before any budget-sensitive decision.** Across a long working
+session, a running mental/logged tally of "real calls spent so far" accumulates rounding,
+missed calls, and estimation gaps (e.g. a call that times out client-side may or may not have
+been billed server-side — genuinely unknowable from the client side alone). Before any
+decision that depends on remaining budget (whether to run a wider/more expensive test, whether
+a plan is safe to proceed with), verify the actual number at the provider's own dashboard
+(SerpApi's account page, seats.aero's own usage view) rather than trusting an accumulated
+estimate, however carefully it was tracked. Report the estimate as a best-effort figure the
+user should confirm themselves, not as an authoritative number to act on.
+
 ## DynamoDB
 
 Two access patterns, one or two tables:

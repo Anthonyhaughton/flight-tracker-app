@@ -15,6 +15,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Protocol
 
+from src.digest import DigestResult
 from src.providers.cash.base import CashFare
 from src.providers.seats_aero import AwardAvailability
 from src.state import Baseline
@@ -34,3 +35,5 @@ class Notifier(Protocol):
     ) -> None: ...
 
     def send_cash_alert(self, fare: CashFare, verdict: Verdict, baseline: Baseline | None) -> None: ...
+
+    def send_digest(self, result: DigestResult) -> None: ...

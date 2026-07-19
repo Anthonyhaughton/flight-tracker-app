@@ -16,7 +16,6 @@ routes:
     date_window:
       start_offset: 30
       end_offset: 330
-    require_cash_comparison: true
   - name: "DC → Europe (broad)"
     active: false
     # Explicit origins override -- must take priority over the top-level list.

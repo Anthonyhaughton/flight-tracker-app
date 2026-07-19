@@ -6,9 +6,18 @@ import respx
 
 import datetime
 
+from src.digest import DigestEntry, DigestResult
 from src.notify.base import Button
-from src.notify.telegram import TelegramError, TelegramNotifier, escape_markdown_v2, format_award_alert, format_cash_alert
+from src.notify.telegram import (
+    TelegramError,
+    TelegramNotifier,
+    escape_markdown_v2,
+    format_award_alert,
+    format_cash_alert,
+    format_digest_alert,
+)
 from src.providers.cash.base import CashFare
+from src.providers.seats_aero import AwardAvailability
 from src.state import Baseline
 from src.valuation import Verdict
 
@@ -183,3 +192,86 @@ def test_telegram_send_raises_on_failure():
     notifier = TelegramNotifier("test-token", "12345")
     with pytest.raises(TelegramError):
         notifier.send("hello")
+
+
+# --- format_digest_alert / send_digest ---
+
+_DIGEST_AWARD = AwardAvailability(
+    origin="IAD", destination="FCO", date=datetime.date(2026, 5, 14), program="aeroplan", cabin="business",
+    miles=88000, taxes_usd=180.0, airlines=["AC"], direct=True, seats=2,
+    availability_id="aeroplan-iad-fco-2026-05-14",
+)
+
+
+def _digest_entry(**overrides) -> DigestEntry:
+    defaults = dict(
+        award=_DIGEST_AWARD,
+        route=None,
+        comparable_cash_usd=5900.0,
+        taxes_usd=180.0,
+        cpp=6.5,
+        trip_value_usd=5720.0,
+        real_time_cpp_floor=2.0,
+        confirmed=True,
+        cleared_real_time_bar=True,
+    )
+    defaults.update(overrides)
+    return DigestEntry(**defaults)
+
+
+def test_format_digest_alert_empty_case_when_nothing_ranked():
+    result = DigestResult(cash_rank=[], cpp_rank=[], candidates_evaluated=42, candidates_ranked=0)
+
+    message = format_digest_alert(result)
+
+    assert "No award availability found this week" in message
+    assert "42" in message
+
+
+def test_format_digest_alert_escapes_and_includes_both_sections():
+    entry = _digest_entry()
+    result = DigestResult(cash_rank=[entry], cpp_rank=[entry], candidates_evaluated=1, candidates_ranked=1)
+
+    message = format_digest_alert(result)
+
+    assert "Top Cash Value" in message
+    assert "Top CPP" in message
+    assert "IAD" in message and "FCO" in message
+    assert "2026\\-05\\-14" in message  # date escaping, same MarkdownV2 rule as the real-time formatters
+    assert "6\\.5" in message  # cpp figure's decimal escaped
+
+
+def test_format_digest_alert_notes_real_time_match():
+    entry = _digest_entry(cleared_real_time_bar=True)
+    result = DigestResult(cash_rank=[entry], cpp_rank=[entry], candidates_evaluated=1, candidates_ranked=1)
+
+    message = format_digest_alert(result)
+
+    assert "⭐" in message
+
+
+def test_format_digest_alert_notes_when_nothing_cleared_real_time_bar():
+    entry = _digest_entry(cleared_real_time_bar=False, cpp=1.2, real_time_cpp_floor=2.0)
+    result = DigestResult(cash_rank=[entry], cpp_rank=[entry], candidates_evaluated=1, candidates_ranked=1)
+
+    message = format_digest_alert(result)
+
+    assert "Nothing cleared the real" in message
+    assert "1\\.2" in message
+    assert "2\\.0" in message
+    assert "⭐" not in message
+
+
+@respx.mock
+def test_send_digest_success():
+    route = respx.post("https://api.telegram.org/bottest-token/sendMessage").mock(
+        return_value=httpx.Response(200, json={"ok": True})
+    )
+    notifier = TelegramNotifier("test-token", "12345")
+    entry = _digest_entry()
+    result = DigestResult(cash_rank=[entry], cpp_rank=[entry], candidates_evaluated=1, candidates_ranked=1)
+
+    notifier.send_digest(result)
+
+    assert route.called
+    assert b"Weekly Deal Digest" in route.calls[0].request.content

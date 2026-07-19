@@ -1,19 +1,24 @@
 from __future__ import annotations
 
+import dataclasses
+
 import httpx
 import pytest
 import respx
 
 import datetime
 
+from src.digest import DigestEntry, DigestResult
 from src.notify.discord import (
     COLOR_CASH_DEAL,
+    COLOR_DIGEST,
     COLOR_GOOD_DEAL,
     DiscordError,
     DiscordNotifier,
     DiscordValidationError,
     format_award_embed,
     format_cash_embed,
+    format_digest_embeds,
 )
 from src.providers.cash.base import CashFare
 from src.state import Baseline
@@ -406,14 +411,149 @@ def test_poller_does_not_record_alert_when_discord_send_raises(saver_business_aw
     class FakeAlertsConfig:
         dedup_ttl_days = 5
 
+    class FakeScheduleConfig:
+        cash_baseline_minutes = 60
+
+    class FakeCashConfig:
+        min_drop_pct = 0.20
+        min_drop_abs_usd = 150
+        mistake_fare_pct = 0.45
+        mistake_fare_ceiling_usd = 200
+
     class FakeConfig:
         awards = config_awards
         alerts = FakeAlertsConfig()
         eligible_programs = None
+        schedule = FakeScheduleConfig()
+        cash = FakeCashConfig()
+
+    class FakeCashProvider:
+        # No-cash-data now always skips (see src/valuation.py's
+        # is_high_value) -- this test is about a Discord SEND failure, not
+        # cash gating, so it needs real data just to reach that send at all.
+        def search(self, origin, destinations, start, end, cabin):
+            return [CashFare(
+                origin=origin, destination=destinations[0], date=start, return_date=None,
+                cabin=cabin, price_usd=5900.0, airline="United", stops=0, deep_link=None,
+            )]
 
     state = InMemoryStateStore()
 
     with pytest.raises(DiscordError):
-        poll_route(FakeSeatsClient(), ["IAD"], route, FakeConfig(), state, notifier)
+        poll_route(FakeSeatsClient(), ["IAD"], route, FakeConfig(), state, notifier, cash_provider=FakeCashProvider())
 
     assert state.already_alerted(award_key(saver_business_award)) is False
+
+
+# --- format_digest_embeds / send_digest ---
+
+
+def _digest_entry(**overrides) -> DigestEntry:
+    defaults = dict(
+        award=saver_business_award_for_digest(),
+        route=None,
+        comparable_cash_usd=5900.0,
+        taxes_usd=180.0,
+        cpp=6.5,
+        trip_value_usd=5720.0,
+        real_time_cpp_floor=2.0,
+        confirmed=True,
+        cleared_real_time_bar=True,
+    )
+    defaults.update(overrides)
+    return DigestEntry(**defaults)
+
+
+def saver_business_award_for_digest():
+    # A local, hardcoded stand-in matching tests/conftest.py's
+    # saver_business_award fixture -- these module-level helper functions
+    # (unlike the tests below) aren't parametrized with the pytest fixture,
+    # so they can't receive it via injection.
+    import datetime
+
+    from src.providers.seats_aero import AwardAvailability
+
+    return AwardAvailability(
+        origin="IAD", destination="FCO", date=datetime.date(2026, 5, 14), program="aeroplan", cabin="business",
+        miles=88000, taxes_usd=180.0, airlines=["AC"], direct=True, seats=2,
+        availability_id="aeroplan-iad-fco-2026-05-14",
+    )
+
+
+def test_format_digest_embeds_empty_case_when_nothing_ranked():
+    result = DigestResult(cash_rank=[], cpp_rank=[], candidates_evaluated=42, candidates_ranked=0)
+
+    embeds = format_digest_embeds(result)
+
+    assert len(embeds) == 1
+    assert embeds[0]["color"] == COLOR_DIGEST
+    assert "No award availability found this week" in embeds[0]["description"]
+    assert "42" in embeds[0]["description"]
+
+
+def test_format_digest_embeds_two_sections_when_entries_exist():
+    cash_entry = _digest_entry()
+    cpp_entry = _digest_entry(
+        award=dataclasses.replace(saver_business_award_for_digest(), availability_id="other-award"),
+        cpp=9.0,
+    )
+    result = DigestResult(cash_rank=[cash_entry], cpp_rank=[cpp_entry], candidates_evaluated=10, candidates_ranked=8)
+
+    embeds = format_digest_embeds(result)
+
+    assert len(embeds) == 2
+    assert embeds[0]["title"] == "Weekly Digest - Top Cash Value"
+    assert embeds[1]["title"] == "Weekly Digest - Top CPP"
+    assert embeds[0]["color"] == COLOR_DIGEST
+    assert len(embeds[0]["fields"]) == 1
+    assert len(embeds[1]["fields"]) == 1
+    assert "IAD -> FCO" in embeds[0]["fields"][0]["name"]
+    assert "Aeroplan" in embeds[0]["fields"][0]["value"]
+    assert "6.5" in embeds[0]["fields"][0]["value"]
+
+
+def test_format_digest_embeds_notes_real_time_match():
+    entry = _digest_entry(cleared_real_time_bar=True)
+    result = DigestResult(cash_rank=[entry], cpp_rank=[entry], candidates_evaluated=1, candidates_ranked=1)
+
+    embeds = format_digest_embeds(result)
+
+    assert "real-time bar" in embeds[0]["fields"][0]["value"]
+
+
+def test_format_digest_embeds_footer_when_nothing_cleared_real_time_bar():
+    entry = _digest_entry(cleared_real_time_bar=False, cpp=1.2, real_time_cpp_floor=2.0)
+    result = DigestResult(cash_rank=[entry], cpp_rank=[entry], candidates_evaluated=1, candidates_ranked=1)
+
+    embeds = format_digest_embeds(result)
+
+    cpp_embed = embeds[1]
+    assert "Nothing cleared the real-time bar" in cpp_embed["footer"]["text"]
+    assert "1.2cpp" in cpp_embed["footer"]["text"]
+    assert "2.0cpp" in cpp_embed["footer"]["text"]
+    assert "would clear real-time bar" not in cpp_embed["fields"][0]["value"]
+
+
+def test_format_digest_embeds_no_footer_when_something_cleared():
+    entry = _digest_entry(cleared_real_time_bar=True)
+    result = DigestResult(cash_rank=[entry], cpp_rank=[entry], candidates_evaluated=1, candidates_ranked=1)
+
+    embeds = format_digest_embeds(result)
+
+    assert "footer" not in embeds[1]
+
+
+@respx.mock
+def test_send_digest_success_on_204():
+    route = respx.post(FAKE_WEBHOOK_URL).mock(return_value=httpx.Response(204))
+    notifier = DiscordNotifier(FAKE_WEBHOOK_URL)
+    entry = _digest_entry()
+    result = DigestResult(cash_rank=[entry], cpp_rank=[entry], candidates_evaluated=1, candidates_ranked=1)
+
+    notifier.send_digest(result)
+
+    assert route.called
+    import json
+
+    payload = json.loads(route.calls[0].request.content)
+    assert len(payload["embeds"]) == 2

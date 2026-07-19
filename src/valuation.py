@@ -11,10 +11,16 @@ Two-stage gate (see .claude/skills/deal-valuation):
 
 As of v1.1, poller.py wires a real `comparable_cash_usd` in from the cached
 cash baseline (see src/cash.py), so stage 2 actually gates alerts.
-`comparable_cash_usd=None` still degrades gracefully to prefilter-only
-(stage 2 skipped) -- e.g. a baseline lookup failure, or a route with no
-cash data yet -- rather than blocking the whole award pipeline on cash
-being available.
+`comparable_cash_usd=None` -- a baseline lookup failure, a provider error,
+or a route with no cash data yet (e.g. genuinely too far out for the cash
+provider to have anything) -- always SKIPS, never fires. This was not
+always true: an earlier version fell back to firing on cabin-match alone
+when cash data was unavailable, on the reasoning that an award pipeline
+shouldn't be blocked by a cash-side outage. That fallback direction was
+retired 2026-07 as a real safety issue found in an architecture review: it
+meant the cash pipeline's failure mode was MORE alerts, not fewer, on a
+system whose explicit top priority is avoiding alert fatigue. There is no
+route-level opt-out of this -- it applies everywhere, unconditionally.
 
 This module also owns two independent cash-fare triggers from deal-valuation,
 both unrelated to any specific award redemption: `is_cash_price_drop()` (a
@@ -76,16 +82,12 @@ def is_high_value(
     wanted_cabins: set[str],
     comparable_cash_usd: float | None = None,
     taxes_usd: float | None = None,
-    require_cash_comparison: bool = False,
 ) -> Verdict:
     if not passes_award_prefilter(award, wanted_cabins):
         return Verdict(False, "cabin not tracked", "")
 
     if comparable_cash_usd is None:
-        if require_cash_comparison:
-            return Verdict(False, "no cash data available yet for CPP-gated route, skipping", "")
-        headline = f"{award.miles:,} {award.program} pts (no cash comparison yet)"
-        return Verdict(True, "saver-equivalent availability in a tracked cabin", headline)
+        return Verdict(False, "cash data unavailable, skipping rather than firing blind", "")
 
     if taxes_usd is None:
         return Verdict(

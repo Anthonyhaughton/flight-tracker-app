@@ -77,14 +77,20 @@ routes:
       # calendar window.
       start_offset: 347   # -> 2027-06-30 relative to 2026-07-18
       end_offset: 361      # -> 2027-07-14 relative to 2026-07-18
-    # CPP-gated: no v1.0 cabin-match-only fallback on this route. See
-    # src/valuation.py's is_high_value and the eligible_programs note above.
-    require_cash_comparison: true
   - name: "DC → Europe (broad)"
     active: true
-    # Per-route origins override -- excludes DCA, unlike the top-level
-    # default. See src/config.py's RouteConfig.origins.
-    origins: [IAD, BWI]
+    # No origins override -- falls back to the top-level [IAD] above. BWI
+    # was removed from here (previously origins: [IAD, BWI]) 2026-07-19: a
+    # pre-flight cost check ahead of the first real digest run found
+    # scripts/.dry_run_state.json holds ZERO cached baselines for
+    # BWI-anything -- BWI has never actually been queried by anything, ever.
+    # Adding it back in would make a run across all 8 destinations x ~18
+    # ISO-week buckets fully cache-cold for that origin, with SerpApi
+    # weekly-baseline cost potentially DOUBLING versus IAD alone (a real
+    # unknown, not a rounding error -- see SESSION_HANDOFF.md). Deferred, not
+    # abandoned: re-add once either a SerpApi tier upgrade affords the extra
+    # volume, or a dedicated, budget-scoped test run of BWI specifically has
+    # established its real density.
     destinations: [LHR, CDG, AMS, FRA, ZRH, LIS, BCN, CPH]
     cabins: [economy]
     date_window:
@@ -92,14 +98,20 @@ routes:
       # search, not the 2027-specific DC -> Italy trip above.
       start_offset: 30
       end_offset: 150
-    # require_cash_comparison omitted -- defaults to false, preserving the
-    # resilient v1.0-style cabin-match-only fallback when no cash data is
-    # available yet.
 
 # --- award valuation ---
 # Saver-vs-dynamic filtering happens at request time (Cached Search's
 # include_filtered param, left omitted -- see seats-aero-integration skill),
 # not a config knob here: there's no per-item saver field to gate on.
+#
+# No route-level opt-out exists for "fire without a cash comparison" -- a
+# candidate with no resolved cash price (provider error, or genuinely no
+# data yet) always skips, on every route, unconditionally
+# (src/valuation.py's is_high_value). An earlier version fell back to
+# firing on cabin-match alone in that situation; that direction was retired
+# 2026-07 as a real safety issue -- it meant a cash-pipeline outage's
+# failure mode was MORE alerts, not fewer, on a system whose top priority
+# is avoiding alert fatigue.
 awards:
   # 250 (previously 400, previously 1500 pre-economy). 400 was a first-pass
   # economy-appropriate guess, never validated against real data. Validated
