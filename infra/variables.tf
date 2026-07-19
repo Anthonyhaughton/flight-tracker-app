@@ -35,9 +35,9 @@ variable "lambda_zip_path" {
 }
 
 variable "award_poll_schedule_expression" {
-  description = "EventBridge Scheduler cron/rate expression for the award cached-search poll."
+  description = "EventBridge Scheduler cron/rate expression for the award cached-search poll. rate(1 hour) (previously rate(20 minutes)) -- matches watchlist.yaml's schedule.award_cached_minutes, raised so combined Cached Search + Get Trips cost stays comfortably under seats.aero's 1,000-call/day quota (a real 2026-07-19 measurement found the 20-minute cadence's per-poll cost alone threatened to exceed it). This Terraform variable is the REAL schedule interval -- watchlist.yaml's own value is config-as-code documentation only, not read by Terraform, and had drifted out of sync with it until this change."
   type        = string
-  default     = "rate(20 minutes)"
+  default     = "rate(1 hour)"
 }
 
 variable "schedule_enabled" {
