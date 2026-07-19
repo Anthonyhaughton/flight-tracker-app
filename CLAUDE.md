@@ -125,16 +125,27 @@ flight-deal-agent/
   `aws-serverless-deploy`).
 - **Least privilege.** The Lambda role gets exactly the DynamoDB tables and secret ARNs it
   needs, nothing wildcard.
+- **Manual invokes always override the CLI's read timeout.** Any manual `aws lambda invoke`
+  against the poller must pass `--cli-read-timeout` set comfortably above the Lambda's
+  currently configured `lambda_timeout` (300s as of 2026-07-19 — see `infra/variables.tf`).
+  The AWS CLI's own default read timeout (60s) is shorter than realistic real execution
+  time; without the override, a slow invoke makes the CLI silently fire a duplicate real
+  invocation via its own retry logic — each one a real, budget-spending run, invisible to
+  whoever ran the command. This is exactly what happened in production once — see
+  `aws-serverless-deploy`'s standing rule.
 
 ## What counts as "high value"
 
 Defined in full in the `deal-valuation` skill. In one line: an award is worth alerting on
 when it is **saver-priced**, in a **cabin the owner cares about** (a `watchlist.yaml`
-per-route config choice — both active routes currently watch **economy**, not the original
-business/first; see `deal-valuation`'s real validated economy-cabin calibration), its
-**program is one the owner can actually book through** (Amex MR / Chase UR transfer
-partners — `eligible_programs`, see `deal-valuation`), and its **effective cents-per-point
-beats the owner's floor for that program** — or when a cash fare drops meaningfully below
+per-route config choice — both active routes watch **economy AND business/first** as of
+2026-07 (business/first re-added alongside economy, not in place of it — see
+`deal-valuation`'s real validated economy-cabin calibration and its premium-cabin sanity
+prefilter section for how a bad premium-cabin redemption is rejected for free before it ever
+costs a cash lookup), its **program is one the owner can actually book through** (Amex MR /
+Chase UR transfer partners — `eligible_programs`, see `deal-valuation`), and its **effective
+cents-per-point beats the owner's floor for that program** — or when a cash fare drops
+meaningfully below
 its tracked baseline. Availability alone is never the trigger. The cash price behind that
 CPP math is itself two-stage (a cheap, cached weekly estimate decides candidacy; one precise
 real call confirms the exact date before a real alert sends) — see `deal-valuation`. A
@@ -152,10 +163,11 @@ all the anti-bot pain lives.
   `telegram-alerting`). Verified via a real manual Lambda invoke: real seats.aero data →
   real valuation → a real Discord alert delivered. Deployed via Terraform using a two-phase
   apply (schedule created disabled, verified with one manual invoke, then enabled — see
-  `aws-serverless-deploy`). **This is still the only code actually running in production —
-  see "Current deploy status" below.**
-- **v1.1 — cash + real valuation. ✅ BUILT, TESTED, AND LOCALLY LIVE-VERIFIED. ⚠️ NEVER
-  DEPLOYED.** `CashFareProvider` (SerpApi) implemented against the live API reference; cash
+  `aws-serverless-deploy`). **No longer the only code deployed — see "Current deploy
+  status" below for what's actually live now.**
+- **v1.1 — cash + real valuation. ✅ BUILT, TESTED, LOCALLY LIVE-VERIFIED, AND NOW
+  DEPLOYED** (2026-07-19, code-live in the Lambda — see "Current deploy status" below).
+  `CashFareProvider` (SerpApi) implemented against the live API reference; cash
   baselines (trailing-min + EMA, ISO-week-bucketed to bound provider call volume) with a real
   exact-date confirm step for finalists before a real alert sends; real effective-CPP gating
   (`comparable_cash_usd` is no longer always `None`); a second, independent cash-price-drop
@@ -170,9 +182,9 @@ all the anti-bot pain lives.
   of this file meant "verified locally against live APIs," not "deployed" — that wording was
   corrected here because it's easy to misread as a deploy claim.**
 - **v1.1.1 — reward-transfer filtering, economy pivot, real threshold calibration,
-  fallback-direction fix, shared-logic refactor. ✅ BUILT, TESTED, LOCALLY LIVE-VERIFIED.
-  ⚠️ NEVER DEPLOYED.** Everything in this phase is real, working, and has never touched the
-  deployed Lambda:
+  fallback-direction fix, shared-logic refactor. ✅ BUILT, TESTED, LOCALLY LIVE-VERIFIED,
+  AND NOW DEPLOYED** (2026-07-19 — see "Current deploy status" below). Everything in this
+  phase is real, working, and code-live in the Lambda as of this deploy:
   - `eligible_programs` allow-list (Amex MR / Chase UR transfer partners, cross-referenced
     against live — not documented, see `seats-aero-integration` — seats.aero source keys).
   - Both active routes switched from business/first to **economy**.
@@ -185,11 +197,12 @@ all the anti-bot pain lives.
   - `poll_route()`'s and `scripts/dry_run.py`'s per-candidate logic was unified into one
     shared `evaluate_candidate()` function, with an object-identity test preventing future
     drift (see the new `avoiding-duplicate-implementations` skill).
-  - A `terraform plan` has been reviewed (source-code-hash-only diff, confirmed clean) but
-    **never applied**.
-- **v1.2 — the weekly digest. ✅ BUILT AND TESTED (mocked only). ⚠️ NOT YET LIVE-VERIFIED.
-  ⚠️ NEVER DEPLOYED.** Same status tier v1.1.1 passed through before its own live
-  verification — see `deal-valuation` for the full implementation detail. `src/digest.py`'s
+  - A `terraform plan` was reviewed (source-code-hash-only diff, confirmed clean) and has
+    since been **applied** (2026-07-19 — see "Current deploy status").
+- **v1.2 — the weekly digest. ✅ BUILT, TESTED, LOCALLY LIVE-VERIFIED, AND NOW DEPLOYED**
+  (2026-07-19 — code-live; the `digest-weekly` EventBridge schedule exists in real AWS but
+  is `DISABLED`, same two-phase discipline as the original schedule; see "Current deploy
+  status" below). `src/digest.py`'s
   `build_weekly_digest()`: for every active route, real Cached Search → `eligible_programs`/
   cabin prefilter → CPP/trip-value computed for every prefilter-passing candidate (not just
   gate-passers) off the cheap weekly-bucketed cash estimate → two independent top-5 rankings
@@ -201,38 +214,119 @@ all the anti-bot pain lives.
   to a digest that ranks everything and sends one aggregate message. Wired into
   `lambda_handler` via a distinct `{"mode": "digest"}` event payload (every other event is
   provably behavior-preserving — see `test_lambda_handler_default_path_is_byte_for_byte_unchanged`)
-  and into `scripts/dry_run.py` via `--mode digest`. 18 new tests, all mocked, full suite
-  green. **Not yet run against real live data** — `--mode digest` has only been smoke-tested
-  with a fake key (confirmed it reaches a real seats.aero call and fails loudly on auth,
-  proving the wiring, not the ranking output). A real `scripts/dry_run.py --mode digest` run
-  against live seats.aero/SerpApi/Discord is the next concrete step, mirroring how v1.1 was
-  live-verified before v1.1.1 was ever considered for deploy — see `SESSION_HANDOFF.md`. No
-  Terraform/infra work has been done for this phase at all yet (the second EventBridge
-  schedule doesn't exist yet, even in an unreviewed plan) — that's a separate, later step
-  after live verification, not started.
+  and into `scripts/dry_run.py` via `--mode digest`, which also now honors `--origins`/
+  `--destinations` (applied uniformly across every active route, since digest mode has no
+  single `--route` to scope to). 18 new tests, all mocked, full suite green. **Live-verified
+  2026-07-19** via a real `scripts/dry_run.py --mode digest --origins IAD --destinations
+  LHR,BCN` run: 960 real candidates evaluated, 516 ranked, both top-5 lists came back full,
+  a real Discord message sent (two embeds, not confirmed byte-for-byte but the send
+  succeeded cleanly), ~32–34 real SerpApi calls total (24 confirmed exactly via
+  `scripts/.dry_run_state.json` timestamp diffing, the rest a bounded estimate) — well
+  inside the pre-flight estimate. The Italy-redirected slice of that same run (destinations
+  overridden onto a route that doesn't normally use them) cost zero extra calls and produced
+  zero ranked candidates, confirmed via the state file showing no new baseline buckets.
+  Terraform work for this phase is also done: the second EventBridge schedule
+  (`digest-weekly`, `{"mode": "digest"}` payload, `DISABLED` by default) exists in `infra/`
+  and has been applied for real (see "Current deploy status" below) — the existing scheduler
+  IAM role/policy required no changes, verified by reading, not assumed.
+- **v1.2.1 — heartbeat fix, Lambda-timeout recalibration, premium-cabin re-add, transfer-bonus
+  annotation, group-winner selection. ✅ BUILT AND TESTED LOCALLY; ⏳ NOT YET APPLIED TO REAL
+  AWS.** All of the following are real, working, code-complete, and covered by the full 261-test
+  suite (green) — but this entire phase is still local Terraform/code state, not deployed:
+  - **Heartbeat namespace bug, fixed.** `src/poller.py`'s `HEARTBEAT_NAMESPACE` corrected from
+    the stale `"flight-deal-agent/Heartbeat"` to `"flight-tracker-app/Heartbeat"`;
+    `infra/iam.tf`'s Heartbeat condition reverted to reference `local.heartbeat_namespace`
+    directly (removing the interim stopgap literal a prior session added). A reviewed
+    `terraform plan` shows the expected single `source_code_hash` change and, notably, **zero
+    diff on the IAM condition itself** — real AWS already had the correct value the whole
+    time, since the "stopgap" turned out to have only ever existed as an uncommitted local
+    file edit, never actually applied (see `avoiding-duplicate-implementations`). Not yet
+    applied.
+  - **Lambda zip build made reproducible.** `scripts/build_lambda_package.sh` now stamps every
+    file to a fixed mtime and feeds `zip` a sorted entry order before packaging — verified via
+    three consecutive rebuilds producing the identical `source_code_hash` (two of them
+    confirmed byte-for-byte via `cmp`). See `aws-serverless-deploy`.
+  - **`lambda_timeout` raised twice, 120s → 300s → 800s** — see `aws-serverless-deploy`'s
+    "Lambda timeout" section for the full two-measurement history. The current 800s figure is
+    based on a REAL 620.3s full-cycle measurement across both routes at the current 3-cabin
+    (economy + business + first) scope. Not yet applied.
+  - **Premium-cabin re-add + free sanity prefilter.** Business/first re-added to both active
+    routes alongside economy (not in place of it); a new `premium_cabin_max_multiplier`
+    (default 2.0) rejects an obviously-bad premium-cabin candidate — miles cost > 2x economy's
+    on the SAME seats.aero record — before any cash lookup, at zero extra API cost (see
+    `deal-valuation`).
+  - **`transfer_bonus_pct` annotation, informational only.** Per-program manually-maintained
+    transfer-bonus fraction; when nonzero, both notifiers show an effective-points-cost
+    annotation alongside the real miles number, never affecting any gate. `virginatlantic` is
+    currently set to **0.3** (confirmed active 2026-07-19, expires 2026-07-31 — see
+    `watchlist.yaml`'s own comment); every other eligible program is still 0.0, unresearched.
+    This is a `watchlist.yaml` change — like any code/config change, it ships in the next
+    Lambda zip rebuild+deploy, not automatically.
+  - **Group-winner selection**, the biggest piece of this phase: per (origin, destination,
+    cabin, program, calendar month) group, only the single highest-cpp candidate now reaches
+    dedup/cap/Get Trips/exact-confirm/notify — see `deal-valuation`'s full spec, including the
+    real finding that motivated it (one flat-rate Aeroplan chart alone had consumed the ENTIRE
+    `max_alerts_per_run` cap across near-duplicate dates in a real Run 1 measurement, see
+    below). Applied identically in `src/digest.py`'s ranking. `src/poller.py`'s
+    `evaluate_candidate()` was split into `classify_candidate()`/`finish_award_candidate()` to
+    make this possible; the shared-function identity test now covers both halves.
 - **v1.3 — further controls.** Inline-keyboard mute/snooze, heartbeat alarm tuning.
 - **v2 — breadth.** "Anywhere in Europe" inspiration search, more programs, mistake-fare
   detection.
 
 ## Current deploy status (read this before assuming anything is live)
 
-**The deployed Lambda is still running pre-v1.1 code** — award-only, business/first cabin,
-no `eligible_programs` filter, no economy support, the original 1.3–1.5cpp/$1,500 thresholds,
-and the old permissive cash-outage fallback (now known to be a real safety issue — see
-`deal-valuation`). None of v1.1 or v1.1.1 above is live. The EventBridge schedule has
-**never been enabled** at any point in this project's history (`schedule_enabled` has been
-`false` since the very first deploy) — the Lambda has never fired on its own schedule, only
-via manual invokes during v1.0 verification.
+**The Lambda's real DEPLOYED code is still v1.0 + v1.1 + v1.1.1 + v1.2, applied directly from
+a reviewed Terraform plan on 2026-07-19** — confirmed via a real `terraform plan` refresh
+against the live backend (not assumed): the deployed `source_code_hash` matches the build that
+includes cash integration, `eligible_programs`, the economy pivot, the recalibrated
+2.0cpp/$250 thresholds, the corrected cash-outage fallback, and `src/digest.py`'s weekly
+digest. **Everything in "v1.2.1" above (heartbeat fix, timeout raise, premium-cabin/transfer-
+bonus/group-winner-selection) is local-only as of this writing — built, tested, terraform
+plans reviewed where applicable, but NOT applied/deployed.** Always verify real Terraform/AWS
+state before assuming what's live; don't trust a prior session's "not yet applied" note as
+still current, in either direction.
 
-Closing this gap requires two more deliberate, reviewed steps, mirroring the v1.0 two-phase
-pattern: apply the already-reviewed Terraform plan (ships the new code, schedule stays off),
-then a second apply flipping `schedule_enabled` to `true`.
+**Both EventBridge schedules exist in real AWS and are both confirmed `DISABLED`** —
+`award-cached-poll` (the original v1.0 schedule) and `digest-weekly` (v1.2's, `{"mode":
+"digest"}` payload) — verified via `terraform state show` and a live AWS query. Nothing has
+fired automatically. **Neither schedule should be enabled until all of the "next concrete
+steps" in `SESSION_HANDOFF.md` are confirmed clean** — v1.2.1 hasn't even been applied yet,
+let alone verified against a real scheduled run.
 
-**One more real gap inside the current config itself:** `watchlist.yaml`'s real
-`DC → Europe (broad)` route sets `origins: [IAD, BWI]` — but only `IAD` has ever actually been
-queried by anything (real API calls or local dry runs). `BWI` is configured and would be
-included the moment this deploys, but its real behavior (does it surface different programs?
-different density?) is completely unverified.
+**The heartbeat bug (real, live in production since the first deploy) is diagnosed AND fixed
+in code — but the fix itself is not yet applied.** See the v1.2.1 bullet above for exactly
+what changed. Until a real `terraform apply` + a manual invoke confirms a heartbeat datapoint
+actually lands, the deployed Lambda is still the OLD, broken code: every real invocation still
+ends in `FunctionError`, and the `flight-tracker-app-missed-heartbeat` alarm is still in real
+`ALARM` state (continuously since 2026-07-17 — confirmed false, safe to ignore, but still
+firing until the real fix ships).
+
+**BWI's exclusion from `DC → Europe (broad)`'s origins — still the right call, but the
+original cost-math justification is now stale and hasn't been explicitly re-confirmed.** The
+`origins` override was removed entirely (deferred, not abandoned — see `watchlist.yaml`'s own
+comment) because a pre-flight check found BWI had never been queried by anything, and adding
+it would make an already-wide route fully cache-cold for that origin. That reasoning was
+computed against an **economy-only** watchlist; business/first have since tripled the
+per-route cabin fan-out, meaning BWI's real incremental cost if re-added is higher than the
+original estimate, not lower — the DECISION (stay IAD-only for now) is if anything reinforced
+by this, but nobody has gone back and explicitly re-run that math against the current 3-cabin
+scope. Not urgent, not blocking anything — just an open confirmation, not a resolved one. See
+`SESSION_HANDOFF.md`'s next steps.
+
+**Steady-state real-world cost measurement is incomplete, and now doubly stale.** "Run 1" (a
+real `scripts/dry_run.py` pass across both routes, 2026-07-19) produced real numbers — 620.3s
+total, 171 SerpApi calls — but that run predates group-winner selection entirely (see
+`aws-serverless-deploy`'s "Lambda timeout" section for the exact breakdown, and
+`deal-valuation`'s group-winner-selection section for what Run 1's own log revealed: the
+entire `max_alerts_per_run` cap consumed by one repeating flat-rate Aeroplan chart). "Run 2"
+(meant to run ~20-25 minutes after Run 1, to characterize genuine steady-state cost with most
+cash buckets still warm) was never executed — explicitly cancelled mid-session before it
+started. Since grouping is expected to change the real cost profile materially (fewer Get
+Trips/exact-confirm calls per run), Run 1's pre-grouping numbers shouldn't be treated as the
+current steady-state baseline either — a fresh Run 1/Run 2 pair with grouping active is more
+informative than finishing the old one. See `SESSION_HANDOFF.md`'s next steps for the
+intended order of operations.
 
 ## Skill index
 

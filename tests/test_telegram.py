@@ -86,6 +86,51 @@ def test_format_award_alert_uses_award_cabin_not_trip_cabin(saver_business_award
     assert "First" not in message
 
 
+def test_format_award_alert_shows_transfer_bonus_when_active(saver_business_award):
+    # SAMPLE_TRIP's MileageCost is 88000 -> 88000 / 1.25 = 70,400 effective.
+    verdict = Verdict(fire=True, reason="saver-equivalent availability", headline="6.5¢/pt vs $5,900 cash")
+    message = format_award_alert(saver_business_award, verdict, SAMPLE_TRIP, transfer_bonus_pct=0.25)
+    assert "transfer bonus active" in message
+    assert "25%" in message
+    assert "70,400" in message
+
+
+def test_format_award_alert_omits_transfer_bonus_when_zero(saver_business_award):
+    # 0.0 (the default/common case) must not show as a "0% bonus" line -- the
+    # line must be absent entirely.
+    verdict = Verdict(fire=True, reason="saver-equivalent availability", headline="6.5¢/pt vs $5,900 cash")
+    message = format_award_alert(saver_business_award, verdict, SAMPLE_TRIP)
+    assert "transfer bonus" not in message
+
+    message_explicit_zero = format_award_alert(saver_business_award, verdict, SAMPLE_TRIP, transfer_bonus_pct=0.0)
+    assert "transfer bonus" not in message_explicit_zero
+
+
+def test_format_award_alert_shows_other_dates_annotation_when_group_has_losers(saver_business_award):
+    # saver_business_award.date is 2026-05-14 -- May.
+    verdict = Verdict(fire=True, reason="saver-equivalent availability", headline="6.5¢/pt vs $5,900 cash")
+    message = format_award_alert(
+        saver_business_award, verdict, SAMPLE_TRIP,
+        group_other_dates=[datetime.date(2026, 5, 20), datetime.date(2026, 5, 24), datetime.date(2026, 5, 31)],
+    )
+    assert "other date(s) in May also qualify" in message
+    assert "\\+3" in message  # the leading '+' is a MarkdownV2 special char, must be escaped
+    assert "2026\\-05\\-20" in message
+    assert "2026\\-05\\-24" in message
+    assert "2026\\-05\\-31" in message
+
+
+def test_format_award_alert_omits_other_dates_annotation_when_none_or_empty(saver_business_award):
+    # None (the default/omitted case) and an explicit empty list must both
+    # show nothing -- never a "+0 other dates" line.
+    verdict = Verdict(fire=True, reason="saver-equivalent availability", headline="6.5¢/pt vs $5,900 cash")
+    message = format_award_alert(saver_business_award, verdict, SAMPLE_TRIP)
+    assert "other date(s)" not in message
+
+    message_empty = format_award_alert(saver_business_award, verdict, SAMPLE_TRIP, group_other_dates=[])
+    assert "other date(s)" not in message_empty
+
+
 def test_format_award_alert_includes_deep_link(saver_business_award):
     verdict = Verdict(fire=True, reason="saver-equivalent availability", headline="6.5¢/pt vs $5,900 cash")
     message = format_award_alert(saver_business_award, verdict, SAMPLE_TRIP, deep_link="https://example.com/book")
@@ -239,6 +284,27 @@ def test_format_digest_alert_escapes_and_includes_both_sections():
     assert "IAD" in message and "FCO" in message
     assert "2026\\-05\\-14" in message  # date escaping, same MarkdownV2 rule as the real-time formatters
     assert "6\\.5" in message  # cpp figure's decimal escaped
+
+
+def test_format_digest_alert_shows_transfer_bonus_when_active():
+    # _DIGEST_AWARD.miles is 88000 -> 88000 / 1.25 = 70,400 effective.
+    entry = _digest_entry(transfer_bonus_pct=0.25)
+    result = DigestResult(cash_rank=[entry], cpp_rank=[entry], candidates_evaluated=1, candidates_ranked=1)
+
+    message = format_digest_alert(result)
+
+    assert "transfer bonus active" in message
+    assert "25%" in message
+    assert "70,400" in message
+
+
+def test_format_digest_alert_omits_transfer_bonus_when_zero():
+    entry = _digest_entry(transfer_bonus_pct=0.0)  # the dataclass default
+    result = DigestResult(cash_rank=[entry], cpp_rank=[entry], candidates_evaluated=1, candidates_ranked=1)
+
+    message = format_digest_alert(result)
+
+    assert "transfer bonus" not in message
 
 
 def test_format_digest_alert_notes_real_time_match():

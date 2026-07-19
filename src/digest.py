@@ -8,39 +8,47 @@ wholesale-reuse case:
 
 - SHARED (imported, not reimplemented): `passes_award_prefilter` and
   `compute_effective_cpp` (src/valuation.py -- the exact same eligible-
-  programs/cabin gate and CPP math src/poller.py's evaluate_candidate() and
+  programs/cabin gate and CPP math src/poller.py's classify_candidate() and
   scripts/dry_run.py already use), `is_high_value` (src/valuation.py -- used
   here for its real fire/skip verdict against CONFIRMED numbers, to answer
   "would this have cleared the real-time bar" without re-deriving that
-  condition), and `get_or_refresh_baseline`/`confirm_exact_date_price`
-  (src/cash.py -- the SAME two-stage cheap-estimate-then-real-confirm cash
-  pricing the real-time path uses).
+  condition), `select_group_winners` (src/valuation.py -- the SAME per-
+  (origin, destination, cabin, program, calendar month) winner-selection
+  the real-time path applies before its own alert cap, see below), and
+  `get_or_refresh_baseline`/`confirm_exact_date_price` (src/cash.py -- the
+  SAME two-stage cheap-estimate-then-real-confirm cash pricing the
+  real-time path uses).
 - NEW (this module): the actual ranking/aggregation orchestration --
   `build_weekly_digest()` walks every active route, ranks ALL surviving
   candidates (not just gate-passers) by the cheap weekly-bucketed estimate,
-  selects two independent top-5 lists, and spends a real exact-date confirm
-  call only on the union of those two lists' finalists (deduped, so a
-  candidate appearing in both lists costs one call, not two).
+  applies group-winner selection (one entry per near-duplicate-date group,
+  same reasoning as the real-time path's alert cap -- see
+  .claude/skills/deal-valuation's winner-selection spec), selects two
+  independent top-5 lists from the survivors, and spends a real exact-date
+  confirm call only on the union of those two lists' finalists (deduped, so
+  a candidate appearing in both lists costs one call, not two).
 
-Deliberately does NOT call src/poller.py's evaluate_candidate(): that
-function's shape is "one candidate, gate it, maybe send one alert, dedup +
-per-run cap apply" -- none of which fits a digest that ranks EVERY candidate
-and sends exactly one aggregate message, with no dedup and no cap. Forcing
-evaluate_candidate() to serve both shapes would mean either a digest that
-silently drops candidates it doesn't gate-pass (wrong -- the whole point is
-ranking the near-misses too) or a special-cased evaluate_candidate() that
-knows about digest mode (a different kind of duplication -- coupling two
-unrelated call shapes into one function). See the skill's "when NOT to
-extract" section: the two orchestrations are genuinely different consumers
-of the same lower-layer math, not duplicate copies of the same logic.
+Deliberately does NOT call src/poller.py's classify_candidate()/
+finish_award_candidate() pair: their shape is "one candidate, gate it,
+maybe send one alert, dedup + per-run cap apply" -- none of which fits a
+digest that ranks EVERY candidate and sends exactly one aggregate message,
+with no dedup and no cap. Forcing them to serve both shapes would mean
+either a digest that silently drops candidates it doesn't gate-pass (wrong
+-- the whole point is ranking the near-misses too) or special-cased
+versions that know about digest mode (a different kind of duplication --
+coupling two unrelated call shapes into one function). See the skill's
+"when NOT to extract" section: the two orchestrations are genuinely
+different consumers of the same lower-layer math, not duplicate copies of
+the same logic.
 
-Unlike poll_route()/evaluate_candidate(), this module never touches dedup
-or state.record_alert() -- a digest is a full snapshot every time, not an
-incremental "what's new" feed, so there is nothing to dedup against. It DOES
-read/write the SAME cash-baseline cache (state.get_baseline/update_baseline
-via get_or_refresh_baseline) the real-time path uses, since that cache's
-whole purpose -- bounding SerpApi call volume via ISO-week bucketing -- helps
-the digest exactly the same way it helps the real-time triggers.
+Unlike poll_route()'s classify_candidate()/finish_award_candidate(), this
+module never touches dedup or state.record_alert() -- a digest is a full
+snapshot every time, not an incremental "what's new" feed, so there is
+nothing to dedup against. It DOES read/write the SAME cash-baseline cache
+(state.get_baseline/update_baseline via get_or_refresh_baseline) the
+real-time path uses, since that cache's whole purpose -- bounding SerpApi
+call volume via ISO-week bucketing -- helps the digest exactly the same way
+it helps the real-time triggers.
 """
 
 from __future__ import annotations
@@ -54,7 +62,7 @@ from src.config import RouteConfig, WatchlistConfig
 from src.providers.cash.base import CashFareProvider
 from src.providers.seats_aero import AwardAvailability, SeatsAeroClient, SeatsAeroRateLimitError
 from src.state import StateStore
-from src.valuation import compute_effective_cpp, is_high_value, passes_award_prefilter
+from src.valuation import compute_effective_cpp, is_high_value, passes_award_prefilter, select_group_winners
 
 logger = logging.getLogger("digest")
 
@@ -89,6 +97,11 @@ class DigestEntry:
     real_time_cpp_floor: float
     confirmed: bool = False
     cleared_real_time_bar: bool | None = None
+    # Snapshotted at ranking time from AwardConfig.bonus_pct(award.program) --
+    # same pattern as real_time_cpp_floor above. 0.0 (the common case) means
+    # no active bonus; notifiers only show the annotation when nonzero.
+    # Purely informational, never affects ranking/gating.
+    transfer_bonus_pct: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -102,14 +115,23 @@ class DigestResult:
     cash_rank: list[DigestEntry]
     cpp_rank: list[DigestEntry]
     candidates_evaluated: int   # every Cached Search hit seen, across all active routes
-    candidates_ranked: int      # survivors of prefilter + known taxes + a resolved cash price
+    # Survivors of prefilter + known taxes + a resolved cash price + group-
+    # winner selection (select_group_winners) -- i.e. how many DISTINCT
+    # deals were actually eligible to appear in a top-5 list, not how many
+    # individual dates were seen (a group's non-winning dates are excluded
+    # here, same as they never reach the real-time path's alert cap).
+    candidates_ranked: int
 
 
 def _passes_ranking_prefilter(award: AwardAvailability, route: RouteConfig, config: WatchlistConfig) -> bool:
-    """Same eligible_programs/cabin gate the real-time path applies before
-    ever spending a cash lookup (src/valuation.py's passes_award_prefilter)
-    -- no reason to rank a program the owner can't actually book through."""
-    return passes_award_prefilter(award, set(route.cabins), config.eligible_programs)
+    """Same eligible_programs/cabin/premium-cabin-ratio gate the real-time
+    path applies before ever spending a cash lookup (src/valuation.py's
+    passes_award_prefilter) -- no reason to rank a program the owner can't
+    actually book through, or a business/first candidate that's already a
+    free-to-detect bad redemption on its face."""
+    return passes_award_prefilter(
+        award, set(route.cabins), config.eligible_programs, config.awards.premium_cabin_max_multiplier,
+    )
 
 
 def _rank_one_route(
@@ -178,6 +200,7 @@ def _rank_one_route(
                 cpp=cpp,
                 trip_value_usd=trip_value_usd,
                 real_time_cpp_floor=config.awards.cpp_floor(award.program),
+                transfer_bonus_pct=config.awards.bonus_pct(award.program),
             )
         )
 
@@ -274,10 +297,23 @@ def build_weekly_digest(
         if rate_limited:
             break
 
-    candidates_ranked = len(all_entries)
+    # Group-winner selection -- the SAME mechanism the real-time path applies
+    # (src/poller.py's poll_route(), src/valuation.py's select_group_winners)
+    # -- BEFORE ranking: multiple near-duplicate dates of one deal (same
+    # origin/destination/cabin/program/calendar month) would otherwise
+    # crowd out genuinely different deals in the top-5 lists, exactly the
+    # same risk the real-time path has against its per-run alert cap. Other
+    # dates in a group are simply dropped here (the digest has no per-entry
+    # "+N other dates" annotation -- that's specific to the real-time
+    # alert, see notify/discord.py and notify/telegram.py), so
+    # candidates_ranked reflects post-grouping survivors: how many DISTINCT
+    # deals were actually eligible to appear in a top-5 list, not how many
+    # individual dates were seen.
+    grouped_winners = [entry for entry, _ in select_group_winners(all_entries)]
+    candidates_ranked = len(grouped_winners)
 
-    cash_rank = sorted(all_entries, key=lambda e: e.trip_value_usd, reverse=True)[:TOP_N]
-    cpp_rank = sorted(all_entries, key=lambda e: e.cpp, reverse=True)[:TOP_N]
+    cash_rank = sorted(grouped_winners, key=lambda e: e.trip_value_usd, reverse=True)[:TOP_N]
+    cpp_rank = sorted(grouped_winners, key=lambda e: e.cpp, reverse=True)[:TOP_N]
 
     # Union of both lists, deduped by availability_id -- a candidate in both
     # top-5s only spends one confirm call, not two.

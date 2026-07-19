@@ -163,6 +163,58 @@ def test_cached_search_skips_unavailable_cabins():
     assert results == []
 
 
+# --- economy_miles: same-record premium-cabin sanity data, no second call ---
+
+
+@respx.mock
+def test_cached_search_business_award_carries_same_record_economy_miles():
+    """economy_miles must come from the SAME Cached Search record's
+    YMileageCost, with NO second call -- confirmed via a real live seats.aero
+    call (2026-07) requesting cabins=economy only and finding J/F
+    (business/first) fields still present on the response; the reverse
+    (requesting business/first and finding Y present, as here) is the same
+    underlying schema fact: seats.aero's `cabins` request param filters which
+    ROWS come back, not which per-cabin FIELDS are present on a row. This is
+    what powers src/valuation.py's free premium-cabin sanity prefilter."""
+    respx.get("https://seats.aero/partnerapi/search").mock(
+        return_value=httpx.Response(200, json=load_fixture("seats_aero_cached_search_mixed_cabins.json"))
+    )
+    client = SeatsAeroClient(api_key="fake-key")
+
+    results = client.cached_search(
+        origin="IAD",
+        destinations=["FCO"],
+        start=datetime.date(2026, 5, 1),
+        end=datetime.date(2026, 6, 1),
+        cabins=["economy", "business", "first"],
+    )
+
+    by_cabin = {r.cabin: r for r in results}
+    assert set(by_cabin) == {"economy", "business", "first"}
+    assert by_cabin["economy"].miles == 30000
+    assert by_cabin["business"].miles == 88000
+    assert by_cabin["first"].miles == 250000
+    # All three came from the SAME record -- economy_miles is identical
+    # across all of them, matching the record's real YMileageCost.
+    assert by_cabin["business"].economy_miles == 30000
+    assert by_cabin["first"].economy_miles == 30000
+    assert by_cabin["economy"].economy_miles == 30000
+
+
+def test_parse_item_economy_miles_is_none_when_economy_unavailable_on_record():
+    """The older business/first-only fixture has no Y fields at all (YAvailable
+    absent) -- economy_miles must come back None, not a crash or a bogus 0,
+    so src/valuation.py's premium-cabin prefilter can tell "can't verify"
+    apart from a real, comparable economy cost."""
+    raw_item = load_fixture("seats_aero_cached_search.json")["data"][0]
+    assert "YAvailable" not in raw_item
+
+    client = SeatsAeroClient(api_key="fake-key")
+    award = client._parse_item(raw_item, ["business"])[0]
+
+    assert award.economy_miles is None
+
+
 @respx.mock
 def test_get_trips_returns_trip_detail():
     respx.get("https://seats.aero/partnerapi/trips/aeroplan-iad-fco-2026-05-14").mock(

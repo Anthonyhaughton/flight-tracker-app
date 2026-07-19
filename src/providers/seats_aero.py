@@ -65,6 +65,19 @@ class AwardAvailability:
     direct: bool
     seats: int | None
     availability_id: str      # the "ID" field, used for Get Trips + dedup
+    # This SAME record's economy (Y) miles cost, when economy is available on
+    # it -- None otherwise (economy genuinely unavailable on this record, or
+    # the raw item lacks YAvailable/YMileageCost entirely). Confirmed via a
+    # real live Cached Search call (2026-07) requesting cabins=economy only:
+    # the response still carries J/F (business/first) fields on the same
+    # record -- seats.aero's `cabins` request param filters which ROWS come
+    # back, not which per-cabin FIELDS are present on a row. So a business/
+    # first AwardAvailability can carry its own record's economy cost with
+    # NO second call, which is exactly what src/valuation.py's premium-cabin
+    # sanity prefilter (premium_cabin_max_multiplier) needs. Defaulted so
+    # existing AwardAvailability(...) call sites (tests, mostly) that predate
+    # this field don't break.
+    economy_miles: int | None = None
 
 
 def _cents_to_usd(cents) -> float:
@@ -200,6 +213,10 @@ class SeatsAeroClient:
         route = item["Route"]
         date = datetime.date.fromisoformat(item["Date"])
         program = item["Source"]
+        # Read once per record, regardless of which cabin(s) were requested --
+        # see AwardAvailability.economy_miles's docstring for why this is safe
+        # (all four cabins' fields are present on every record, confirmed live).
+        economy_miles = int(item["YMileageCost"]) if item.get("YAvailable") else None
         out: list[AwardAvailability] = []
         for cabin in cabins:
             code = _CABIN_CODES[cabin]
@@ -226,6 +243,7 @@ class SeatsAeroClient:
                     direct=bool(item.get(f"{code}Direct", False)),
                     seats=item.get(f"{code}RemainingSeats"),
                     availability_id=item["ID"],
+                    economy_miles=economy_miles,
                 )
             )
         return out

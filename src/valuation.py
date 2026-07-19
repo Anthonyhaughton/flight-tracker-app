@@ -41,6 +41,7 @@ $0 here -- that would silently inflate the effective CPP.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Protocol, TypeVar
 
 from src.config import AwardConfig, CashConfig
 from src.providers.seats_aero import AwardAvailability
@@ -55,18 +56,41 @@ class Verdict:
 
 
 def passes_award_prefilter(
-    award: AwardAvailability, wanted_cabins: set[str], eligible_programs: set[str] | None = None
+    award: AwardAvailability,
+    wanted_cabins: set[str],
+    eligible_programs: set[str] | None = None,
+    premium_cabin_max_multiplier: float | None = None,
 ) -> bool:
     """eligible_programs is the set of seats.aero source keys reachable via
     the owner's actual transfer partnerships (see watchlist.yaml's
     eligible_programs). None means unrestricted -- pre-eligible_programs
     behavior, and what every caller that doesn't care about this axis gets
     by default. A candidate whose program isn't eligible is rejected here,
-    before a cash lookup or Get Trips call is ever spent on it."""
+    before a cash lookup or Get Trips call is ever spent on it.
+
+    premium_cabin_max_multiplier (watchlist.yaml's awards.
+    premium_cabin_max_multiplier, None means unrestricted -- same convention
+    as eligible_programs) is a FREE sanity check, spent before any cash
+    lookup: a business/first candidate is rejected if its own miles cost
+    exceeds this multiplier times economy's miles cost on the SAME seats.aero
+    record (award.economy_miles) -- e.g. a business fare costing >2x what
+    economy costs on the identical record is a bad redemption on its face,
+    not worth a paid cash-provider call to confirm. Only applies to cabin in
+    {"business", "first"}; economy candidates are never subject to this
+    check. When economy_miles is unresolvable for the record (None or <= 0
+    -- economy genuinely wasn't available on it, or the field was absent),
+    the ratio can't be verified, so the candidate is rejected rather than let
+    through unchecked -- same "unknown is never assumed safe" rule as
+    taxes_usd=None elsewhere in this module."""
     if award.cabin not in wanted_cabins:
         return False
     if eligible_programs is not None and award.program not in eligible_programs:
         return False
+    if premium_cabin_max_multiplier is not None and award.cabin in ("business", "first"):
+        if award.economy_miles is None or award.economy_miles <= 0:
+            return False
+        if award.miles > premium_cabin_max_multiplier * award.economy_miles:
+            return False
     return True
 
 
@@ -74,6 +98,68 @@ def compute_effective_cpp(comparable_cash_usd: float, taxes_fees_usd: float, mil
     if miles <= 0:
         return 0.0
     return (comparable_cash_usd - taxes_fees_usd) / miles * 100
+
+
+def compute_transfer_bonus_effective_miles(miles: int, transfer_bonus_pct: float) -> float:
+    """Informational only -- the real-currency-equivalent points cost of a
+    transfer with an active bonus (e.g. a +25% Amex MR -> program transfer
+    promo needs fewer actual MR points for the same award). Never feeds into
+    compute_effective_cpp/is_high_value or any other gating decision -- see
+    watchlist.yaml's transfer_bonus_pct comment and AwardConfig.bonus_pct.
+    `transfer_bonus_pct` is a fraction (0.25 = 25%), matching this project's
+    other *_pct config fields (e.g. CashConfig.min_drop_pct)."""
+    return miles / (1 + transfer_bonus_pct)
+
+
+def group_key(award: AwardAvailability) -> tuple:
+    """(origin, destination, cabin, program, year, month) -- candidates
+    sharing this key represent "the same deal on a different date within
+    the same calendar month" for select_group_winners()'s purposes. Scoped
+    to calendar MONTH, not the whole date window: two dates a month or more
+    apart are genuinely different real trip options (different vacation
+    windows), not near-duplicates of one deal -- collapsing an entire
+    ~150-day window down to a single winner would be too aggressive and
+    would silently hide real, distinct flexibility. See .claude/skills/
+    deal-valuation's winner-selection spec."""
+    return (award.origin, award.destination, award.cabin, award.program, award.date.year, award.date.month)
+
+
+class _HasAwardAndCpp(Protocol):
+    award: AwardAvailability
+    cpp: float
+
+
+_T = TypeVar("_T", bound=_HasAwardAndCpp)
+
+
+def select_group_winners(candidates: list[_T]) -> list[tuple[_T, list]]:
+    """Groups `candidates` by group_key() and returns ONLY the single
+    highest-cpp candidate per group, paired with every OTHER date in that
+    same group (sorted ascending, excluding the winner's own date) -- every
+    other candidate is dropped entirely by simply not being included in the
+    return value, so a caller that only acts on this function's output
+    naturally never sends/caps/confirms them as anything but grouped out.
+
+    Works on anything exposing `.award` (AwardAvailability) and `.cpp`
+    (float, always the cheap first-pass/weekly-bucket estimate -- never a
+    fresh or exact-date-confirmed lookup, so calling this costs nothing new)
+    -- `AwardFirstPassResult` for the real-time path (src/poller.py) and
+    `DigestEntry` for the weekly digest (src/digest.py) both qualify, so the
+    SAME grouping mechanism serves both call sites, never reimplemented
+    per caller (see .claude/skills/avoiding-duplicate-implementations).
+
+    Ties (equal cpp within a group) are broken by earliest date -- arbitrary
+    but deterministic, so the same input always produces the same winner."""
+    groups: dict[tuple, list[_T]] = {}
+    for c in candidates:
+        groups.setdefault(group_key(c.award), []).append(c)
+
+    winners: list[tuple[_T, list]] = []
+    for group in groups.values():
+        winner = max(group, key=lambda c: (c.cpp, -c.award.date.toordinal()))
+        other_dates = sorted(c.award.date for c in group if c.award.date != winner.award.date)
+        winners.append((winner, other_dates))
+    return winners
 
 
 def is_high_value(

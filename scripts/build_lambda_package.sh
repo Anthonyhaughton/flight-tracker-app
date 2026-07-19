@@ -70,8 +70,21 @@ cp "$REPO_ROOT/watchlist.yaml" "$BUILD_DIR/watchlist.yaml"
 # Bytecode caches aren't needed at runtime -- just bloats the zip.
 find "$BUILD_DIR" -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
 
+# Normalize every file's mtime to a fixed epoch before zipping. Without this,
+# `pip install` and `cp` leave real filesystem timestamps on each file, which
+# `zip` embeds per-entry -- so two builds from byte-identical inputs produce
+# different outer zip hashes (confirmed: 3 rebuilds, 2,386 files, zero content
+# diffs, 3 different outer hashes). This is what made source_code_hash
+# untrustworthy as a "did anything actually change" signal. Fixed timestamps
+# mean the hash only changes when file content changes.
+echo "Normalizing file timestamps for a reproducible zip..."
+find "$BUILD_DIR" -exec touch -t 202001010000 {} +
+
 echo "Zipping to ${ZIP_PATH#"$REPO_ROOT"/}..."
 mkdir -p "$(dirname "$ZIP_PATH")"
-(cd "$BUILD_DIR" && zip -r -X -q "$ZIP_PATH" .)
+# `find | sort | zip -@` (rather than `zip -r .`) also fixes entry ORDER, not
+# just per-entry timestamps -- readdir order isn't guaranteed stable across
+# rebuilds either, and zip stores entries in the order it receives them.
+(cd "$BUILD_DIR" && find . -type f | sort | zip -X -q "$ZIP_PATH" -@)
 
 echo "Built ${ZIP_PATH#"$REPO_ROOT"/} ($(du -h "$ZIP_PATH" | cut -f1))"

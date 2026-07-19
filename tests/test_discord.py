@@ -105,6 +105,53 @@ def test_format_award_embed_omits_seats_field_when_unknown(saver_business_award)
     assert "Seats" not in names
 
 
+def test_format_award_embed_shows_transfer_bonus_when_active(saver_business_award):
+    # trip's MileageCost is 88000 (SAMPLE_TRIP) -- 88000 / 1.25 = 70,400 effective.
+    embed = format_award_embed(saver_business_award, SAMPLE_VERDICT, SAMPLE_TRIP, transfer_bonus_pct=0.25)
+    fields_by_name = {f["name"]: f["value"] for f in embed["fields"]}
+    assert "Transfer Bonus" in fields_by_name
+    assert "25%" in fields_by_name["Transfer Bonus"]
+    assert "70,400" in fields_by_name["Transfer Bonus"]
+
+
+def test_format_award_embed_omits_transfer_bonus_field_when_zero(saver_business_award):
+    # 0.0 (the default/common case) must not show as a "0% bonus" field --
+    # it must be absent entirely.
+    embed = format_award_embed(saver_business_award, SAMPLE_VERDICT, SAMPLE_TRIP)
+    names = [f["name"] for f in embed["fields"]]
+    assert "Transfer Bonus" not in names
+
+    embed_explicit_zero = format_award_embed(saver_business_award, SAMPLE_VERDICT, SAMPLE_TRIP, transfer_bonus_pct=0.0)
+    names_explicit_zero = [f["name"] for f in embed_explicit_zero["fields"]]
+    assert "Transfer Bonus" not in names_explicit_zero
+
+
+def test_format_award_embed_shows_other_dates_annotation_when_group_has_losers(saver_business_award):
+    # saver_business_award.date is 2026-05-14 -- May.
+    embed = format_award_embed(
+        saver_business_award, SAMPLE_VERDICT, SAMPLE_TRIP,
+        group_other_dates=[datetime.date(2026, 5, 20), datetime.date(2026, 5, 24), datetime.date(2026, 5, 31)],
+    )
+    fields_by_name = {f["name"]: f["value"] for f in embed["fields"]}
+    assert "Other Dates" in fields_by_name
+    assert "+3 other date(s) in May also qualify" in fields_by_name["Other Dates"]
+    assert "2026-05-20" in fields_by_name["Other Dates"]
+    assert "2026-05-24" in fields_by_name["Other Dates"]
+    assert "2026-05-31" in fields_by_name["Other Dates"]
+
+
+def test_format_award_embed_omits_other_dates_field_when_none_or_empty(saver_business_award):
+    # None (the default/omitted case) and an explicit empty list must both
+    # show nothing -- never a "+0 other dates" field.
+    embed = format_award_embed(saver_business_award, SAMPLE_VERDICT, SAMPLE_TRIP)
+    names = [f["name"] for f in embed["fields"]]
+    assert "Other Dates" not in names
+
+    embed_empty = format_award_embed(saver_business_award, SAMPLE_VERDICT, SAMPLE_TRIP, group_other_dates=[])
+    names_empty = [f["name"] for f in embed_empty["fields"]]
+    assert "Other Dates" not in names_empty
+
+
 def test_format_award_embed_no_markdown_escaping_needed(saver_business_award):
     # Discord embeds render plain text -- a literal '.' or '-' must NOT be
     # backslash-escaped the way Telegram's MarkdownV2 requires.
@@ -510,6 +557,28 @@ def test_format_digest_embeds_two_sections_when_entries_exist():
     assert "IAD -> FCO" in embeds[0]["fields"][0]["name"]
     assert "Aeroplan" in embeds[0]["fields"][0]["value"]
     assert "6.5" in embeds[0]["fields"][0]["value"]
+
+
+def test_format_digest_embeds_shows_transfer_bonus_when_active():
+    # award.miles is 88000 (saver_business_award_for_digest) -> 88000/1.25 = 70,400.
+    entry = _digest_entry(transfer_bonus_pct=0.25)
+    result = DigestResult(cash_rank=[entry], cpp_rank=[entry], candidates_evaluated=1, candidates_ranked=1)
+
+    embeds = format_digest_embeds(result)
+
+    value = embeds[0]["fields"][0]["value"]
+    assert "transfer bonus active" in value
+    assert "25%" in value
+    assert "70,400" in value
+
+
+def test_format_digest_embeds_omits_transfer_bonus_when_zero():
+    entry = _digest_entry(transfer_bonus_pct=0.0)  # the dataclass default
+    result = DigestResult(cash_rank=[entry], cpp_rank=[entry], candidates_evaluated=1, candidates_ranked=1)
+
+    embeds = format_digest_embeds(result)
+
+    assert "transfer bonus" not in embeds[0]["fields"][0]["value"]
 
 
 def test_format_digest_embeds_notes_real_time_match():

@@ -65,13 +65,28 @@ data "aws_iam_policy_document" "lambda_permissions" {
   }
 
   statement {
-    sid       = "Heartbeat"
-    actions   = ["cloudwatch:PutMetricData"]
-    resources = ["*"] # CloudWatch PutMetricData has no resource-level ARNs; scoped by namespace instead
+    sid     = "Heartbeat"
+    actions = ["cloudwatch:PutMetricData"]
+    # cloudwatch:PutMetricData has NO resource-level ARN support in AWS's
+    # IAM action reference -- Resource must be "*" for this action, full
+    # stop, unlike DynamoDB/SSM above which scope to specific table/parameter
+    # ARNs. This is a genuine AWS API limitation, not a lapse in this file's
+    # otherwise-universal no-wildcards discipline -- the Condition below is
+    # the only real narrowing lever the API allows, so it carries all the
+    # scoping weight instead of Resource.
+    resources = ["*"]
     condition {
       test     = "StringEquals"
       variable = "cloudwatch:namespace"
-      values   = [local.heartbeat_namespace]
+      # local.heartbeat_namespace (infra/monitoring.tf) evaluates to
+      # "${var.project_name}/Heartbeat" i.e. "flight-tracker-app/Heartbeat", which
+      # now matches src/poller.py's HEARTBEAT_NAMESPACE constant -- keep both in
+      # sync if the project name changes. (This condition was briefly hardcoded to
+      # the stale pre-rename string "flight-deal-agent/Heartbeat" as an interim
+      # stopgap, to match the code's then-still-wrong constant; that stopgap is
+      # removed now that src/poller.py's constant is fixed -- see
+      # avoiding-duplicate-implementations's "stale rename strings" section.)
+      values = [local.heartbeat_namespace]
     }
   }
 }

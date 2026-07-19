@@ -46,4 +46,11 @@ def saver_business_award() -> AwardAvailability:
         direct=True,
         seats=2,
         availability_id="aeroplan-iad-fco-2026-05-14",
+        # economy_miles=50000 -> 88000/50000 = 1.76x, clears the default 2.0x
+        # premium_cabin_max_multiplier -- chosen so this shared fixture keeps
+        # passing src/valuation.py's premium-cabin prefilter unchanged for
+        # every existing test that doesn't care about that feature. A test
+        # that specifically wants the ratio check to REJECT overrides this
+        # via dataclasses.replace(..., economy_miles=...).
+        economy_miles=50000,
     )

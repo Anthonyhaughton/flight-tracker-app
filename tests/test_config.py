@@ -37,6 +37,34 @@ def test_cpp_floor_falls_back_to_default():
     assert config.awards.cpp_floor("some_unlisted_program") == config.awards.cpp_floors["default"]
 
 
+def test_premium_cabin_max_multiplier_defaults_when_absent_from_fixture():
+    # The fixture predates this field entirely -- must fall back to the
+    # dataclass default (2.0), not raise or silently become 0/None.
+    config = load_watchlist(FIXTURE_PATH)
+    assert config.awards.premium_cabin_max_multiplier == 2.0
+
+
+def test_transfer_bonus_pct_defaults_to_empty_dict_when_absent_from_fixture():
+    config = load_watchlist(FIXTURE_PATH)
+    assert config.awards.transfer_bonus_pct == {}
+    assert config.awards.bonus_pct("aeroplan") == 0.0  # no entry -> 0.0, not a crash
+
+
+def test_bonus_pct_reads_configured_value(tmp_path):
+    fixture_with_bonus = tmp_path / "with_bonus.yaml"
+    text = FIXTURE_PATH.read_text()
+    # Inject a transfer_bonus_pct block right after cpp_floors' "default" line.
+    text = text.replace(
+        "    default: 1.4\n",
+        "    default: 1.4\n  transfer_bonus_pct:\n    aeroplan: 0.25\n",
+    )
+    fixture_with_bonus.write_text(text)
+
+    config = load_watchlist(fixture_with_bonus)
+    assert config.awards.bonus_pct("aeroplan") == 0.25
+    assert config.awards.bonus_pct("united") == 0.0  # not listed -> default 0.0
+
+
 def test_eligible_programs_loads_from_top_level_key():
     config = load_watchlist(FIXTURE_PATH)
     assert config.eligible_programs == ["aeroplan", "united", "flyingblue"]
@@ -176,6 +204,54 @@ def test_real_watchlist_thresholds_match_validated_values():
     # scoped to reachable programs + default, not an indiscriminate
     # find-replace across the whole cpp_floors dict.
     assert config.awards.cpp_floors.get("aadvantage") == 1.5
+
+
+def test_real_watchlist_both_active_routes_track_economy_and_premium_cabins():
+    """Regression: business/first were re-added 2026-07 alongside economy
+    (not in place of it) on both active routes, now that
+    premium_cabin_max_multiplier exists as a free sanity check -- catches a
+    partial edit that widens one route's cabins but not the other's."""
+    config = load_watchlist()  # real watchlist.yaml, not the fixture
+    for route in config.active_routes():
+        assert set(route.cabins) == {"economy", "business", "first"}, (
+            f"{route.name}'s cabins are {route.cabins}, expected economy+business+first"
+        )
+
+
+def test_real_watchlist_premium_cabin_max_multiplier_is_configured():
+    config = load_watchlist()  # real watchlist.yaml, not the fixture
+    assert config.awards.premium_cabin_max_multiplier == 2.0
+
+
+def test_real_watchlist_transfer_bonus_pct_covers_every_eligible_program():
+    """Regression: transfer_bonus_pct is manually maintained -- every real
+    eligible_programs entry should have an explicit (even if 0.0) entry, so a
+    missing program isn't silently indistinguishable from "definitely no
+    bonus" vs "nobody has checked yet"."""
+    config = load_watchlist()  # real watchlist.yaml, not the fixture
+    assert config.eligible_programs is not None
+    for program in config.eligible_programs:
+        assert program in config.awards.transfer_bonus_pct, f"{program} has no explicit transfer_bonus_pct entry"
+
+
+def test_real_watchlist_virginatlantic_transfer_bonus_reflects_confirmed_promo():
+    """Regression: virginatlantic has a real, confirmed-active Amex MR 30%
+    transfer bonus (2026-07-19 through 2026-07-31) -- must be 0.3, not the
+    unresearched-default 0.0 every other program currently sits at. This test
+    targets the LIVE watchlist.yaml specifically so it fails loudly if the
+    bonus is accidentally reset to 0.0 before the real expiry date, or if a
+    find-replace ever touches every entry indiscriminately instead of just
+    this one confirmed program."""
+    config = load_watchlist()  # real watchlist.yaml, not the fixture
+    assert config.awards.bonus_pct("virginatlantic") == 0.3
+
+    # Every other eligible program is deliberately still 0.0 -- unresearched,
+    # not confirmed zero, just not yet checked. Not asserting a specific
+    # reason, just that this one confirmed promo didn't silently spread.
+    for program in config.eligible_programs:
+        if program == "virginatlantic":
+            continue
+        assert config.awards.bonus_pct(program) == 0.0, f"{program} unexpectedly has a nonzero transfer_bonus_pct"
 
 
 def test_real_watchlist_europe_broad_route_has_no_origins_override():

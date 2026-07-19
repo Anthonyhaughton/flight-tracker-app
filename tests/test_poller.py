@@ -90,12 +90,14 @@ class FakeCashFareProvider:
 
 class FakeNotifier:
     def __init__(self):
-        self.sent: list[tuple] = []  # (award, verdict, trip, deep_link)
+        self.sent: list[tuple] = []  # (award, verdict, trip, deep_link, transfer_bonus_pct, group_other_dates)
         self.cash_sent: list[tuple] = []  # (fare, verdict, baseline)
         self.closed = False
 
-    def send_award_alert(self, award, verdict, trip, *, deep_link=None) -> None:
-        self.sent.append((award, verdict, trip, deep_link))
+    def send_award_alert(
+        self, award, verdict, trip, *, deep_link=None, transfer_bonus_pct=0.0, group_other_dates=None,
+    ) -> None:
+        self.sent.append((award, verdict, trip, deep_link, transfer_bonus_pct, group_other_dates))
 
     def send_cash_alert(self, fare, verdict, baseline) -> None:
         self.cash_sent.append((fare, verdict, baseline))
@@ -151,6 +153,12 @@ def make_award(**overrides) -> AwardAvailability:
         direct=True,
         seats=2,
         availability_id="aeroplan-iad-fco-2026-05-14",
+        # economy_miles=50000 -> 88000/50000 = 1.76x, clears the default 2.0x
+        # premium_cabin_max_multiplier -- keeps every pre-existing test that
+        # doesn't care about the premium-cabin prefilter passing unchanged.
+        # A test that specifically wants the ratio check to REJECT overrides
+        # this explicitly (see the premium-cabin prefilter tests below).
+        economy_miles=50000,
     )
     defaults.update(overrides)
     return AwardAvailability(**defaults)
@@ -327,9 +335,22 @@ def make_distinct_awards(n: int) -> list[AwardAvailability]:
     buckets by miles // 5000 * 5000) and none collide with each other."""
     return [
         make_award(
-            availability_id=f"aeroplan-iad-fco-2026-05-{14 + i}",
-            date=datetime.date(2026, 5, 14 + i),
+            availability_id=f"aeroplan-iad-fco-2026-{5 + i:02d}-14",
+            # A different CALENDAR MONTH per award, not just a different day
+            # within May -- select_group_winners() groups by (origin,
+            # destination, cabin, program, month), so same-month-different-
+            # day awards would now collapse to a single winner, which is
+            # exactly wrong for tests about the cap/dedup mechanism across
+            # genuinely INDEPENDENT candidates (see .claude/skills/
+            # deal-valuation's winner-selection spec).
+            date=datetime.date(2026, 5 + i, 14),
             miles=88000 + i * 10000,
+            # economy_miles scales alongside miles so the ratio stays well
+            # under the default 2.0x premium_cabin_max_multiplier regardless
+            # of n -- these awards are meant to differ only in date/miles-
+            # bucket/dedup-key, not accidentally trip the premium-cabin
+            # prefilter as n grows.
+            economy_miles=50000 + i * 10000,
         )
         for i in range(n)
     ]
@@ -1092,6 +1113,258 @@ def test_poller_fires_eligible_program_when_eligible_programs_set():
     assert alerts_sent == 1
 
 
+# --- premium_cabin_max_multiplier: free sanity prefilter on business/first ---
+
+
+def test_poller_skips_premium_cabin_candidate_exceeding_multiplier_before_any_provider_call():
+    """premium_cabin_max_multiplier must reject a business/first candidate
+    BEFORE a cash lookup or Get Trips call is ever spent on it -- assert call
+    counts, not just the outcome, matching
+    test_poller_skips_ineligible_program_before_any_provider_call's pattern:
+    a version that filtered too late (e.g. after the cash lookup) would still
+    produce alerts_sent == 0 but waste a real provider call in production."""
+    config = make_config()  # premium_cabin_max_multiplier defaults to 2.0
+    # economy_miles=30000, business miles=88000 -> 2.93x, over the 2.0x default.
+    award = make_award(cabin="business", miles=88000, economy_miles=30000)
+    seats_client = FakeSeatsAeroClient([award])
+    cash_provider = FakeCashFareProvider([[make_fare(price_usd=5900.0)]])
+    state = InMemoryStateStore()
+    notifier = FakeNotifier()
+    heartbeat = FakeHeartbeat()
+
+    alerts_sent = run(
+        config, cash_provider=cash_provider, seats_client=seats_client, state=state, notifier=notifier,
+        heartbeat=heartbeat,
+    )
+
+    assert alerts_sent == 0
+    assert notifier.sent == []
+    assert cash_provider.calls == []  # no cash lookup was ever attempted
+    assert seats_client.get_trips_calls == []  # no Get Trips call was ever attempted
+
+
+def test_poller_fires_premium_cabin_candidate_within_multiplier():
+    config = make_config()
+    # economy_miles=60000, business miles=88000 -> 1.47x, within the 2.0x default.
+    award = make_award(cabin="business", miles=88000, economy_miles=60000)
+    seats_client = FakeSeatsAeroClient([award])
+    state = InMemoryStateStore()
+    notifier = FakeNotifier()
+    heartbeat = FakeHeartbeat()
+
+    alerts_sent = run(
+        config, cash_provider=FakeCashFareProvider(default_fare=make_fare(price_usd=5900.0)),
+        seats_client=seats_client, state=state, notifier=notifier, heartbeat=heartbeat,
+    )
+
+    assert alerts_sent == 1
+
+
+def test_poller_does_not_apply_premium_cabin_multiplier_to_economy():
+    # An economy candidate must never be rejected by the ratio check, even
+    # with no economy_miles data of its own (it IS the economy record).
+    # make_config()'s route only tracks business/first by default -- widen it
+    # to include economy so this test isn't rejected by the CABIN check
+    # instead of proving anything about the ratio check.
+    base_config = make_config()
+    economy_route = dataclasses.replace(base_config.routes[0], cabins=["economy", "business", "first"])
+    config = dataclasses.replace(base_config, routes=[economy_route])
+    award = make_award(cabin="economy", miles=20000, economy_miles=None, taxes_usd=75.0)
+    seats_client = FakeSeatsAeroClient([award])
+    state = InMemoryStateStore()
+    notifier = FakeNotifier()
+    heartbeat = FakeHeartbeat()
+
+    alerts_sent = run(
+        config, cash_provider=FakeCashFareProvider(default_fare=make_fare(price_usd=5900.0)),
+        seats_client=seats_client, state=state, notifier=notifier, heartbeat=heartbeat,
+    )
+
+    assert alerts_sent == 1
+
+
+# --- transfer_bonus_pct: informational only, surfaced to the notifier ---
+
+
+def test_poller_passes_transfer_bonus_pct_to_notifier_when_configured():
+    base_config = make_config()
+    config = dataclasses.replace(
+        base_config, awards=dataclasses.replace(base_config.awards, transfer_bonus_pct={"aeroplan": 0.25}),
+    )
+    award = make_award()  # program="aeroplan"
+    seats_client = FakeSeatsAeroClient([award])
+    state = InMemoryStateStore()
+    notifier = FakeNotifier()
+    heartbeat = FakeHeartbeat()
+
+    run(
+        config, cash_provider=FakeCashFareProvider(default_fare=make_fare(price_usd=5900.0)),
+        seats_client=seats_client, state=state, notifier=notifier, heartbeat=heartbeat,
+    )
+
+    assert len(notifier.sent) == 1
+    transfer_bonus_pct = notifier.sent[0][4]
+    assert transfer_bonus_pct == 0.25
+
+
+def test_poller_passes_zero_transfer_bonus_pct_when_program_not_listed():
+    # aeroplan has no entry in transfer_bonus_pct -- bonus_pct() must default
+    # to 0.0, not raise or silently pick some other program's value.
+    config = make_config()  # transfer_bonus_pct defaults to {} -> bonus_pct() always 0.0
+    award = make_award()  # program="aeroplan"
+    seats_client = FakeSeatsAeroClient([award])
+    state = InMemoryStateStore()
+    notifier = FakeNotifier()
+    heartbeat = FakeHeartbeat()
+
+    run(
+        config, cash_provider=FakeCashFareProvider(default_fare=make_fare(price_usd=5900.0)),
+        seats_client=seats_client, state=state, notifier=notifier, heartbeat=heartbeat,
+    )
+
+    assert len(notifier.sent) == 1
+    assert notifier.sent[0][4] == 0.0
+
+
+# --- group-winner selection: prevents near-duplicate dates of one deal
+# from crowding the per-run alert cap -- see .claude/skills/deal-valuation's
+# winner-selection spec and src/valuation.py's select_group_winners ---
+
+
+def test_poll_route_group_winner_selection_only_confirms_highest_cpp_of_four_same_month_candidates():
+    """4 same route/cabin/program candidates, different dates within the
+    SAME calendar month -- only the single highest-cpp one (d2, cheapest
+    miles here) should reach Get Trips/exact-confirm/notify. The other 3
+    must be accounted for as grouped_out -- NOT sent, NOT capped, NOT
+    confirmed (no Get Trips call spent on any of them)."""
+    from src.poller import poll_route
+
+    config = make_config()
+    route = config.routes[0]
+    awards = [
+        make_award(availability_id="d1", date=datetime.date(2026, 8, 5), miles=90000, economy_miles=60000),
+        make_award(availability_id="d2", date=datetime.date(2026, 8, 12), miles=60000, economy_miles=60000),
+        make_award(availability_id="d3", date=datetime.date(2026, 8, 20), miles=95000, economy_miles=60000),
+        make_award(availability_id="d4", date=datetime.date(2026, 8, 27), miles=110000, economy_miles=60000),
+    ]
+    seats_client = FakeSeatsAeroClient(awards)
+    cash_provider = FakeCashFareProvider(default_fare=make_fare(price_usd=5900.0))
+    state = InMemoryStateStore()
+    notifier = FakeNotifier()
+
+    stats = poll_route(seats_client, config.origins, route, config, state, notifier, cash_provider=cash_provider)
+
+    assert stats.skipped_grouped_out == 3
+    assert stats.skipped_capped == 0
+    assert stats.skipped_duplicate == 0
+    assert stats.alerts_sent == 1
+    assert len(notifier.sent) == 1
+    assert notifier.sent[0][0].availability_id == "d2"  # lowest miles -> highest cpp, at fixed cash price
+    assert seats_client.get_trips_calls == ["d2"]  # Get Trips spent ONLY on the winner
+
+
+def test_poll_route_group_winner_selection_is_independent_per_program():
+    """Mixed case: an Aeroplan IAD-FCO candidate and a Virgin Atlantic
+    IAD-FCO candidate, same month -- both must fire independently, proving
+    grouping is scoped per PROGRAM, not just per route/cabin/date."""
+    from src.poller import poll_route
+
+    base_config = make_config()
+    config = dataclasses.replace(
+        base_config,
+        awards=dataclasses.replace(
+            base_config.awards, cpp_floors={"default": 1.4, "aeroplan": 1.5, "virginatlantic": 1.5},
+        ),
+    )
+    route = config.routes[0]
+
+    aeroplan_award = make_award(availability_id="aeroplan-award", program="aeroplan", date=datetime.date(2026, 8, 10))
+    virgin_award = make_award(
+        availability_id="virgin-award", program="virginatlantic", date=datetime.date(2026, 8, 15),
+    )
+    seats_client = FakeSeatsAeroClient([aeroplan_award, virgin_award])
+    cash_provider = FakeCashFareProvider(default_fare=make_fare(price_usd=5900.0))
+    state = InMemoryStateStore()
+    notifier = FakeNotifier()
+
+    stats = poll_route(seats_client, config.origins, route, config, state, notifier, cash_provider=cash_provider)
+
+    assert stats.skipped_grouped_out == 0
+    assert stats.alerts_sent == 2
+    sent_ids = {sent[0].availability_id for sent in notifier.sent}
+    assert sent_ids == {"aeroplan-award", "virgin-award"}
+
+
+def test_poll_route_group_winner_selection_produces_two_winners_across_different_months():
+    """Regression: collapsing an ENTIRE ~150-day window down to a single
+    winner per route would be too aggressive -- dates a month or more apart
+    are genuinely different trip options. Same route/cabin/program, one
+    qualifying date in August and one in October, must produce TWO winners
+    (two real alerts), not one."""
+    from src.poller import poll_route
+
+    config = make_config()
+    route = config.routes[0]
+    august_award = make_award(availability_id="august-award", date=datetime.date(2026, 8, 10))
+    october_award = make_award(availability_id="october-award", date=datetime.date(2026, 10, 15))
+    seats_client = FakeSeatsAeroClient([august_award, october_award])
+    cash_provider = FakeCashFareProvider(default_fare=make_fare(price_usd=5900.0))
+    state = InMemoryStateStore()
+    notifier = FakeNotifier()
+
+    stats = poll_route(seats_client, config.origins, route, config, state, notifier, cash_provider=cash_provider)
+
+    assert stats.skipped_grouped_out == 0
+    assert stats.alerts_sent == 2
+    sent_ids = {sent[0].availability_id for sent in notifier.sent}
+    assert sent_ids == {"august-award", "october-award"}
+
+
+def test_poll_route_sends_other_dates_annotation_when_group_has_losers():
+    """The winning alert must name the other qualifying dates in its own
+    (origin, destination, cabin, program, month) group that it beat --
+    Notifier.send_award_alert's group_other_dates kwarg, sorted ascending,
+    excluding the winner's own date."""
+    from src.poller import poll_route
+
+    config = make_config()
+    route = config.routes[0]
+    awards = [
+        make_award(availability_id="d1", date=datetime.date(2026, 8, 5), miles=90000, economy_miles=60000),
+        make_award(availability_id="d2", date=datetime.date(2026, 8, 12), miles=60000, economy_miles=60000),  # winner
+        make_award(availability_id="d3", date=datetime.date(2026, 8, 20), miles=95000, economy_miles=60000),
+    ]
+    seats_client = FakeSeatsAeroClient(awards)
+    cash_provider = FakeCashFareProvider(default_fare=make_fare(price_usd=5900.0))
+    state = InMemoryStateStore()
+    notifier = FakeNotifier()
+
+    poll_route(seats_client, config.origins, route, config, state, notifier, cash_provider=cash_provider)
+
+    assert len(notifier.sent) == 1
+    group_other_dates = notifier.sent[0][5]
+    assert group_other_dates == [datetime.date(2026, 8, 5), datetime.date(2026, 8, 20)]
+
+
+def test_poll_route_sends_no_other_dates_annotation_when_group_has_no_losers():
+    """A group of exactly one candidate must NOT show the annotation at
+    all -- empty/None, never a "+0 other dates" line."""
+    from src.poller import poll_route
+
+    config = make_config()
+    route = config.routes[0]
+    award = make_award()
+    seats_client = FakeSeatsAeroClient([award])
+    cash_provider = FakeCashFareProvider(default_fare=make_fare(price_usd=5900.0))
+    state = InMemoryStateStore()
+    notifier = FakeNotifier()
+
+    poll_route(seats_client, config.origins, route, config, state, notifier, cash_provider=cash_provider)
+
+    assert len(notifier.sent) == 1
+    assert notifier.sent[0][5] == []
+
+
 def test_poller_uses_route_origins_override_not_top_level():
     """A route with its own `origins` override must be queried using THAT
     origin list, not the top-level config.origins -- see RouteConfig.origins
@@ -1163,7 +1436,8 @@ def test_run_does_not_close_an_injected_notifier():
 
 
 # --- structural drift-proofing: poll_route() and scripts/dry_run.py must
-# call the ONE shared evaluate_candidate(), never a second copy of it ---
+# call the SAME shared classify_candidate()/finish_award_candidate() pair,
+# never a second copy of either ---
 
 
 # --- lambda_handler mode dispatch: {"mode": "digest"} routes to run_digest(),
@@ -1223,18 +1497,18 @@ def test_lambda_handler_default_path_is_byte_for_byte_unchanged(monkeypatch):
         assert calls == {"run": 1, "run_digest": 0}
 
 
-def test_dry_run_script_calls_the_same_evaluate_candidate_object_as_poll_route():
+def test_dry_run_script_calls_the_same_classify_and_finish_functions_as_poll_route():
     """This is an object-identity check, not a behavioral one on purpose.
     A future edit could reintroduce a second, textually-similar copy of
-    evaluate_candidate() inside scripts/dry_run.py (e.g. someone "just
-    inlines a tweak" for a one-off test) that still passes every behavioral
-    test in this file, since it would still produce plausible-looking
-    output -- exactly the failure mode that let this script drift out of
-    sync with production twice before (a missed trips[0] regression, and
-    later missing the entire v1.1 cash wiring). Asserting object identity
-    (`is`, not `==`) fails loudly the moment scripts/dry_run.py stops
-    calling src.poller.evaluate_candidate itself, regardless of how
-    similar a replacement looks."""
+    classify_candidate()/finish_award_candidate() inside scripts/dry_run.py
+    (e.g. someone "just inlines a tweak" for a one-off test) that still
+    passes every behavioral test in this file, since it would still produce
+    plausible-looking output -- exactly the failure mode that let this
+    script drift out of sync with production twice before (a missed
+    trips[0] regression, and later missing the entire v1.1 cash wiring).
+    Asserting object identity (`is`, not `==`) fails loudly the moment
+    scripts/dry_run.py stops calling src.poller's shared functions
+    themselves, regardless of how similar a replacement looks."""
     import importlib.util
     from pathlib import Path
 
@@ -1245,11 +1519,17 @@ def test_dry_run_script_calls_the_same_evaluate_candidate_object_as_poll_route()
     dry_run_module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(dry_run_module)  # runs module-level code only -- main() is __name__-guarded, never called
 
-    assert dry_run_module.evaluate_candidate is poller_module.evaluate_candidate
-    # Same check for the other two pieces of the shared contract dry_run.py
-    # depends on -- PollStats (the mutable aggregation object) and
-    # TripFetchResult (the fetch_trip callback's return type) -- a
-    # redefinition of either, even an identical-looking one, would silently
-    # break the shared function's actual contract.
+    assert dry_run_module.classify_candidate is poller_module.classify_candidate
+    assert dry_run_module.finish_award_candidate is poller_module.finish_award_candidate
+    # Same check for the group-winner-selection function both this script
+    # and poll_route() call on the shared function's output, plus the other
+    # pieces of the shared contract dry_run.py depends on -- PollStats (the
+    # mutable aggregation object), TripFetchResult (the fetch_trip
+    # callback's return type), and ClassifyResult (classify_candidate's
+    # return type) -- a redefinition of any of these, even an identical-
+    # looking one, would silently break the shared function's actual
+    # contract.
+    assert dry_run_module.select_group_winners is poller_module.select_group_winners
     assert dry_run_module.PollStats is poller_module.PollStats
     assert dry_run_module.TripFetchResult is poller_module.TripFetchResult
+    assert dry_run_module.ClassifyResult is poller_module.ClassifyResult

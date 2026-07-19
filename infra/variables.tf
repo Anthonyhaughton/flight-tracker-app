@@ -17,9 +17,9 @@ variable "aws_region" {
 }
 
 variable "lambda_timeout" {
-  description = "Poller Lambda timeout, in seconds. Work is I/O-bound, not CPU-bound."
+  description = "Poller Lambda timeout, in seconds. Work is I/O-bound, not CPU-bound. 800s (previously 300s, itself previously 120s -- see aws-serverless-deploy's \"Lambda timeout\" section for the full two-raise history). The 300s figure was measured (2026-07-19) against an economy-only watchlist.yaml at 65s total; business/first were re-added to both active routes the SAME session, tripling per-route cabin fan-out, and a fresh real scripts/dry_run.py measurement across BOTH routes immediately afterward took 620.3s total (DC -> Italy 155.22s + DC -> Europe (broad) 465.08s, the latter also spending its first real Get-Trips/exact-confirm calls and exhausting the full max_alerts_per_run cap -- see the skill for the exact call counts). 800s is ~1.3x that 620.3s baseline, stays under Lambda's 900s hard ceiling with 100s to spare, and leaves ~6.7 minutes of margin before the next 20-minute-cadence scheduled invocation (watchlist.yaml's schedule.award_cached_minutes) -- a real, tighter margin than 300s had, not hidden. Group-winner selection (see deal-valuation's winner-selection spec, built the same session as this measurement) is expected to reduce real Get-Trips/exact-confirm call volume going forward; re-measure with grouping active before tuning this number or the cap any further -- see SESSION_HANDOFF.md."
   type        = number
-  default     = 120
+  default     = 800
 }
 
 variable "lambda_memory_mb" {

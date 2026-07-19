@@ -8,11 +8,36 @@ from src.providers.seats_aero import AwardAvailability
 from src.state import Baseline
 from src.valuation import (
     compute_effective_cpp,
+    compute_transfer_bonus_effective_miles,
+    group_key,
     is_cash_below_mistake_fare_ceiling,
     is_cash_price_drop,
     is_high_value,
     passes_award_prefilter,
+    select_group_winners,
 )
+
+
+@dataclasses.dataclass(frozen=True)
+class _Candidate:
+    """Minimal stand-in for anything select_group_winners() accepts --
+    AwardFirstPassResult (src/poller.py) and DigestEntry (src/digest.py)
+    both qualify via the same `.award`/`.cpp` duck-typed shape; this local
+    type exercises the grouping mechanism itself without pulling in either
+    caller's full dataclass."""
+
+    award: AwardAvailability
+    cpp: float
+
+
+def _award(**overrides) -> AwardAvailability:
+    defaults = dict(
+        origin="IAD", destination="LHR", date=datetime.date(2026, 8, 10), program="aeroplan", cabin="business",
+        miles=88000, taxes_usd=180.0, airlines=["AC"], direct=True, seats=2,
+        availability_id="aeroplan-iad-lhr-2026-08-10",
+    )
+    defaults.update(overrides)
+    return AwardAvailability(**defaults)
 
 
 def test_prefilter_rejects_untracked_cabin(saver_business_award):
@@ -39,6 +64,58 @@ def test_prefilter_eligible_programs_none_means_unrestricted(saver_business_awar
     assert passes_award_prefilter(saver_business_award, {"business", "first"}, None) is True
 
 
+# --- premium_cabin_max_multiplier: free sanity check on business/first ---
+
+
+def test_prefilter_rejects_premium_cabin_candidate_exceeding_multiplier(saver_business_award):
+    # saver_business_award: miles=88000, economy_miles=50000 -> 1.76x.
+    # Tightening the multiplier below that ratio must reject it.
+    over_ratio_award = dataclasses.replace(saver_business_award, miles=88000, economy_miles=30000)  # 2.93x
+    assert passes_award_prefilter(over_ratio_award, {"business", "first"}, None, 2.0) is False
+
+
+def test_prefilter_accepts_premium_cabin_candidate_within_multiplier(saver_business_award):
+    # 88000/50000 = 1.76x, under the 2.0x default multiplier.
+    assert passes_award_prefilter(saver_business_award, {"business", "first"}, None, 2.0) is True
+
+
+def test_prefilter_accepts_premium_cabin_candidate_exactly_at_multiplier(saver_business_award):
+    # Exactly AT the multiplier (not over it) must still pass -- only
+    # STRICTLY exceeding the multiplier is a rejection.
+    at_ratio_award = dataclasses.replace(saver_business_award, miles=100000, economy_miles=50000)  # exactly 2.0x
+    assert passes_award_prefilter(at_ratio_award, {"business", "first"}, None, 2.0) is True
+
+
+def test_prefilter_rejects_premium_cabin_candidate_with_unresolvable_economy_miles(saver_business_award):
+    # economy_miles=None (economy genuinely unavailable on this record, or
+    # the field was absent) -- can't verify the ratio, so reject rather than
+    # let it through unchecked. Same "unknown is never assumed safe" rule as
+    # taxes_usd=None elsewhere in this module.
+    unresolvable_award = dataclasses.replace(saver_business_award, economy_miles=None)
+    assert passes_award_prefilter(unresolvable_award, {"business", "first"}, None, 2.0) is False
+
+
+def test_prefilter_rejects_premium_cabin_candidate_with_zero_economy_miles(saver_business_award):
+    zero_award = dataclasses.replace(saver_business_award, economy_miles=0)
+    assert passes_award_prefilter(zero_award, {"business", "first"}, None, 2.0) is False
+
+
+def test_prefilter_premium_cabin_max_multiplier_none_means_unrestricted(saver_business_award):
+    # None (the default/omitted case) must not apply the ratio check at all --
+    # even a candidate with no economy_miles data must pass, matching
+    # eligible_programs' own None-means-unrestricted convention.
+    unresolvable_award = dataclasses.replace(saver_business_award, economy_miles=None)
+    assert passes_award_prefilter(unresolvable_award, {"business", "first"}, None, None) is True
+    assert passes_award_prefilter(unresolvable_award, {"business", "first"}) is True  # omitted entirely
+
+
+def test_prefilter_premium_cabin_multiplier_does_not_apply_to_economy(saver_business_award):
+    # The ratio check is scoped to business/first only -- an economy
+    # candidate must never be rejected by it, regardless of economy_miles.
+    economy_award = dataclasses.replace(saver_business_award, cabin="economy", economy_miles=None)
+    assert passes_award_prefilter(economy_award, {"economy"}, None, 2.0) is True
+
+
 def test_compute_effective_cpp_screaming_deal():
     # 120k miles for a $6,000 business seat -> 5.0 cpp
     cpp = compute_effective_cpp(comparable_cash_usd=6000, taxes_fees_usd=0, miles=120_000)
@@ -53,6 +130,100 @@ def test_compute_effective_cpp_trap():
 
 def test_compute_effective_cpp_zero_miles_is_zero():
     assert compute_effective_cpp(comparable_cash_usd=500, taxes_fees_usd=0, miles=0) == 0.0
+
+
+def test_compute_transfer_bonus_effective_miles_with_active_bonus():
+    # 88,000 miles at a 25% transfer bonus -> 88000 / 1.25 = 70,400 effective.
+    assert compute_transfer_bonus_effective_miles(88000, 0.25) == 70400.0
+
+
+def test_compute_transfer_bonus_effective_miles_zero_bonus_is_unchanged():
+    assert compute_transfer_bonus_effective_miles(88000, 0.0) == 88000.0
+
+
+# --- group_key / select_group_winners: per-route/cabin/program/month
+# winner selection, see .claude/skills/deal-valuation's winner-selection
+# spec ---
+
+
+def test_group_key_shares_origin_destination_cabin_program_and_month():
+    a = _award(date=datetime.date(2026, 8, 5))
+    b = _award(date=datetime.date(2026, 8, 28), availability_id="other-date")
+    assert group_key(a) == group_key(b)
+
+
+def test_group_key_differs_by_month_even_with_everything_else_equal():
+    a = _award(date=datetime.date(2026, 8, 28))
+    b = _award(date=datetime.date(2026, 9, 1), availability_id="next-month")
+    assert group_key(a) != group_key(b)
+
+
+def test_select_group_winners_keeps_only_highest_cpp_of_four_same_month_candidates():
+    """4 same route/cabin/program candidates, different dates within the
+    SAME month -> only the single highest-cpp one is returned as a winner.
+    The other 3 are simply absent from the return value entirely -- the
+    caller (poll_route()/build_weekly_digest()) never sends/caps/confirms
+    them because they're never even handed anything to act on."""
+    candidates = [
+        _Candidate(award=_award(date=datetime.date(2026, 8, 5), availability_id="d1"), cpp=1.5),
+        _Candidate(award=_award(date=datetime.date(2026, 8, 12), availability_id="d2"), cpp=2.8),  # highest
+        _Candidate(award=_award(date=datetime.date(2026, 8, 20), availability_id="d3"), cpp=2.1),
+        _Candidate(award=_award(date=datetime.date(2026, 8, 27), availability_id="d4"), cpp=0.9),
+    ]
+
+    winners = select_group_winners(candidates)
+
+    assert len(winners) == 1
+    winner, other_dates = winners[0]
+    assert winner.award.availability_id == "d2"
+    assert other_dates == [datetime.date(2026, 8, 5), datetime.date(2026, 8, 20), datetime.date(2026, 8, 27)]
+
+
+def test_select_group_winners_is_independent_per_program():
+    """Mixed case: an Aeroplan IAD-LHR candidate and a Virgin Atlantic
+    IAD-LHR candidate, same month -- proves grouping is scoped per PROGRAM,
+    not just per route, so two genuinely different redemptions never
+    collapse into one just because they share an origin/destination/cabin/
+    month."""
+    aeroplan = _Candidate(award=_award(program="aeroplan", availability_id="aeroplan-award"), cpp=2.0)
+    virgin = _Candidate(award=_award(program="virginatlantic", availability_id="virgin-award"), cpp=2.5)
+
+    winners = select_group_winners([aeroplan, virgin])
+
+    assert len(winners) == 2
+    winning_ids = {w.award.availability_id for w, _ in winners}
+    assert winning_ids == {"aeroplan-award", "virgin-award"}
+    # Neither winner has any "other dates" -- each is alone in its own group.
+    assert all(other_dates == [] for _, other_dates in winners)
+
+
+def test_select_group_winners_does_not_collapse_the_whole_window_across_months():
+    """Regression: an earlier design collapsed an ENTIRE ~150-day window
+    down to a single winner across the whole route. Dates a month or more
+    apart are genuinely different trip options -- same route/cabin/program,
+    one qualifying date in August and one in October, must produce TWO
+    winners, not one."""
+    august = _Candidate(award=_award(date=datetime.date(2026, 8, 15), availability_id="august-date"), cpp=3.0)
+    october = _Candidate(award=_award(date=datetime.date(2026, 10, 20), availability_id="october-date"), cpp=1.2)
+
+    winners = select_group_winners([august, october])
+
+    assert len(winners) == 2
+    winning_ids = {w.award.availability_id for w, _ in winners}
+    assert winning_ids == {"august-date", "october-date"}
+    assert all(other_dates == [] for _, other_dates in winners)
+
+
+def test_select_group_winners_ties_broken_by_earliest_date():
+    earlier = _Candidate(award=_award(date=datetime.date(2026, 8, 5), availability_id="earlier"), cpp=2.0)
+    later = _Candidate(award=_award(date=datetime.date(2026, 8, 20), availability_id="later"), cpp=2.0)
+
+    winners = select_group_winners([later, earlier])  # order-independent
+
+    assert len(winners) == 1
+    winner, other_dates = winners[0]
+    assert winner.award.availability_id == "earlier"
+    assert other_dates == [datetime.date(2026, 8, 20)]
 
 
 def test_is_high_value_skips_without_cash_data(saver_business_award, award_config):

@@ -137,6 +137,124 @@ correctly rejects this via the trip-value floor. Worth knowing this exists as a 
 some program/route combinations are just bad, consistently, and won't become good deals no
 matter how the CPP floor is tuned.
 
+## Premium-cabin sanity prefilter (`premium_cabin_max_multiplier`)
+
+Business/first were re-added to both active routes (2026-07) alongside economy, not in place
+of it. Re-adding them reopens a real risk the economy-cabin recalibration above exists to
+avoid: an obviously-bad premium-cabin redemption reaching a paid cash lookup at all. The fix
+is a FREE (no cash lookup, no seats.aero Get Trips call) sanity check, applied at the exact
+same layer as `eligible_programs` — `passes_award_prefilter()` — before any provider call:
+
+A business/first candidate is rejected outright if its own miles cost exceeds
+`watchlist.yaml`'s `awards.premium_cabin_max_multiplier` (default **2.0**) times **economy's
+miles cost on the SAME seats.aero record**. This works with zero extra API cost: a single
+Cached Search record carries every cabin's fields (`YMileageCost`/`JMileageCost`/
+`FMileageCost`/…) regardless of which cabins were requested — confirmed via a real live call
+requesting `cabins=economy` only and finding `J`/`F` fields still present on the response. See
+`AwardAvailability.economy_miles` (`src/providers/seats_aero.py`), populated once per record
+and attached to every cabin variant parsed from it.
+
+Only applies to `cabin in {"business", "first"}` — economy is never subject to this check.
+When `economy_miles` can't be resolved for a record (economy genuinely wasn't available on
+it, or the field was simply absent), the candidate is **rejected, not let through unchecked**
+— the same "unknown is never assumed safe" rule this module already applies to
+`taxes_usd=None`. `premium_cabin_max_multiplier=None` disables the check entirely (same
+None-means-unrestricted convention as `eligible_programs`).
+
+Wired into every caller that already runs the `eligible_programs`/cabin prefilter:
+`src/poller.py`'s `poll_route()`, `src/digest.py`'s `_passes_ranking_prefilter`, and
+`scripts/dry_run.py`'s own loop (all three must stay in lockstep — see
+`avoiding-duplicate-implementations`).
+
+## Transfer bonus annotation (`transfer_bonus_pct`) — informational only
+
+`watchlist.yaml`'s `awards.transfer_bonus_pct` is a per-program fraction (0.25 = 25%),
+**manually maintained by the owner — no automated fetching of any kind** — for a currently-
+running promotional transfer bonus (e.g. Amex MR → program X at +25%). Defaults to 0.0 (no
+bonus) for any program without an explicit entry.
+
+**Purely informational: never feeds into any gating/threshold decision.** `compute_effective_
+cpp`, `is_high_value`, and every dedup/cap/valuation gate are completely unaffected — this
+only changes what the alert/digest *displays*, never whether it fires. The real-currency-
+equivalent points cost is `miles_required / (1 + transfer_bonus_pct)` (see
+`src/valuation.py`'s `compute_transfer_bonus_effective_miles`), computed off the alert's
+already-authoritative miles figure (the Get-Trips-confirmed number for a real-time alert, the
+snapshotted ranking figure for a digest entry) — not a separately-fetched or separately-
+gated number.
+
+When nonzero for the alerting/ranked award's program, both `DiscordNotifier` and
+`TelegramNotifier` show an "N% transfer bonus active — effective cost ~X,XXX pts" annotation,
+in both places a miles number already appears: the real-time award alert, and every ranked
+entry in the weekly digest (`src/digest.py`'s `DigestEntry.transfer_bonus_pct`, snapshotted at
+ranking time from `AwardConfig.bonus_pct()`, same pattern as `real_time_cpp_floor`). A `0.0`
+bonus (the common case) shows nothing at all — never a "0% bonus" line.
+
+## Group-winner selection (per route/cabin/program/calendar month)
+
+**The real finding that motivated this, not a hypothetical.** A real `scripts/dry_run.py`
+steady-state cost-measurement run (2026-07-19, "Run 1", against the live `DC → Europe
+(broad)` route right after business/first were re-added) sent exactly 8 real award alerts —
+the `max_alerts_per_run` cap, in full — and every single one of them was the SAME flat-rate
+Aeroplan business award chart (75,000 miles, a known fixed Aeroplan zone price, not a
+coincidence): 4 near-identical dates on IAD→LHR, 4 more on IAD→CDG. **91 additional
+candidates that had genuinely cleared the first-pass gate were then capped** — never even
+reaching Get Trips/confirm — purely because one flat-rate chart, repeating across nearby
+dates, had already exhausted the entire cap before any other program or route got a real
+chance to compete for it. A candidate genuinely open on several nearby dates in the same
+window was alerting (or, in the digest, ranking) once **per date**, and a flat award chart is
+exactly the shape that reliably repeats across many dates at an identical price — the
+opposite of the rare, meaningfully-different deal this system exists to surface. Fixed by
+grouping every first-pass-gate-passing candidate **before** it ever reaches Get Trips, the
+exact-date confirm, dedup, the per-run alert cap, or the digest's top-5 selection — see
+`src/valuation.py`'s `group_key()` and `select_group_winners()`.
+
+**Group key: `(origin, destination, cabin, program, calendar year+month)`.** Within a group,
+only the single highest-cpp candidate survives — everyone else in that group is dropped
+**entirely**: not sent, not counted as capped, not counted as a duplicate, never spends a real
+Get Trips or exact-date-confirm call. `cpp` here is always the cheap first-pass weekly-bucket
+estimate already computed for the first-pass gate — grouping costs nothing new. Ties (equal
+cpp) are broken by earliest date, arbitrary but deterministic.
+
+**Deliberately scoped to calendar MONTH, not the whole date window.** An earlier design that
+collapsed an entire ~150-day window down to one winner per route was too aggressive: two
+dates a month or more apart are genuinely different real trip options (different vacation
+windows), not near-duplicates of the same deal, and each deserves its own shot at the cap —
+collapsing them would silently hide real flexibility the owner would want to know about.
+Within the SAME month, though, near-duplicate dates really are "the same deal, pick the best
+one" — hence the month-level grouping, not day-level or window-level.
+
+**The sent alert names what it beat.** A winner with other qualifying dates in its own group
+gets an "+N other date(s) in {Month} also qualify (2026-08-20, 2026-08-24, 2026-08-31)"
+annotation (both `DiscordNotifier` and `TelegramNotifier`, via `Notifier.send_award_alert`'s
+`group_other_dates` kwarg) — flexibility isn't silently hidden, just not spammed as N separate
+messages. A group with no losers (the common case) shows nothing at all, same "0 stays quiet"
+convention as `transfer_bonus_pct`'s 0.0 case.
+
+**Scoped per-route, not across the whole multi-route `run()` invocation.** `poll_route()`
+groups across all of one route's origins, not across every active route in a single `run()`
+call — a deliberate, documented simplification: the real `watchlist.yaml`'s active routes
+have disjoint destination sets today, so per-route and per-run scoping produce identical
+results for the current config, and per-route keeps `poll_route()`'s existing self-contained
+contract intact (callers that invoke it directly still get full dedup/cap/send behavior in
+one call, no restructuring of `run()`'s cross-route orchestration). Revisit this scoping
+decision if a future route ever shares destinations with another active route.
+
+**The digest applies the identical grouping before its own top-5 selection** — same
+`select_group_winners()` call, same group key, same reasoning (near-duplicate dates
+crowding out genuinely different deals, this time in the top-5-cash/top-5-CPP lists instead
+of the per-run cap). `DigestResult.candidates_ranked` reflects the POST-grouping survivor
+count, not the raw number of distinct dates seen — consistent with what the number is
+actually used for ("how many distinct deals were eligible to rank," not "how many Cached
+Search rows matched"). The digest has no per-entry "other dates" annotation of its own (that's
+specific to the real-time alert, which names exactly one winner at a time) — a group's
+non-winning entries are simply absent from the ranked list.
+
+**Shared, not reimplemented**, per `avoiding-duplicate-implementations`: `scripts/dry_run.py`'s
+real-time mode calls the exact same `classify_candidate()` → `select_group_winners()` →
+`finish_award_candidate()` sequence `poll_route()` does (its own loop naturally scopes
+grouping to whichever single `--route` it's testing, since that script only ever loads one
+route's hits — not a divergence, just the same function fed a narrower input).
+
 ## The fallback-direction fix: no resolved cash price always skips
 
 **A real safety issue found in an architecture review, fixed, not hypothetical.** An earlier
@@ -183,7 +301,7 @@ not an accumulation of candidates seen incrementally over the preceding week.
   `eligible_programs`/cabin prefilter (`passes_award_prefilter`, same gate the real-time path
   applies, so an ineligible program never costs a cash lookup here either) → for every
   surviving candidate — not just gate-passers — CPP and trip value are computed
-  (`compute_effective_cpp`, the exact same function `evaluate_candidate()` uses) off the
+  (`compute_effective_cpp`, the exact same function `classify_candidate()` uses) off the
   cheap, already-cached weekly-bucketed baseline (`get_or_refresh_baseline`). A candidate with
   unknown taxes (`taxes_usd is None`) is excluded from ranking, same rule as
   `is_high_value`'s zero-inflation guard above. Two independent top-5 rankings result: top 5
@@ -206,16 +324,17 @@ not an accumulation of candidates seen incrementally over the preceding week.
   running `is_high_value` (the exact real-time gate function, not a re-derived condition)
   against each finalist's CONFIRMED numbers, so "would this have fired a real alert" is
   authoritative, not approximated.
-- **Its own orchestration, deliberately NOT `evaluate_candidate()`:** a "shared lower layer,
-  different upper orchestration" case, per `avoiding-duplicate-implementations` — dedup, the
-  per-run `max_alerts_per_run` cap, and single-alert-notify all describe a *gate-then-maybe-
-  send-one-alert* shape that doesn't fit a digest that ranks EVERY candidate and sends exactly
-  one aggregate message with no dedup and no cap. Forcing `evaluate_candidate()` to serve both
-  shapes would mean either silently dropping near-misses the digest exists to surface, or a
-  special-cased `evaluate_candidate()` that knows about digest mode — a different kind of
-  duplication. What IS shared: `passes_award_prefilter`, `compute_effective_cpp`,
-  `is_high_value`, `get_or_refresh_baseline`, `confirm_exact_date_price` — the actual valuation
-  math, imported and called directly, never re-derived.
+- **Its own orchestration, deliberately NOT `classify_candidate()`/`finish_award_candidate()`:**
+  a "shared lower layer, different upper orchestration" case, per
+  `avoiding-duplicate-implementations` — dedup, the per-run `max_alerts_per_run` cap, and
+  single-alert-notify all describe a *gate-then-maybe-send-one-alert* shape that doesn't fit a
+  digest that ranks EVERY candidate and sends exactly one aggregate message with no dedup and
+  no cap. Forcing those functions to serve both shapes would mean either silently dropping
+  near-misses the digest exists to surface, or special-cased versions that know about digest
+  mode — a different kind of duplication. What IS shared: `passes_award_prefilter`,
+  `compute_effective_cpp`, `is_high_value`, `select_group_winners`, `get_or_refresh_baseline`,
+  `confirm_exact_date_price` — the actual valuation math (including group-winner selection, see
+  above), imported and called directly, never re-derived.
 - **Notifier delivery:** `Notifier.send_digest()` on both `DiscordNotifier` (two embeds — Top
   Cash Value, Top CPP — one message's embed set, not ten separate alert-style messages) and
   `TelegramNotifier` (one MarkdownV2 message, two sections), kept in sync per this project's

@@ -31,8 +31,131 @@ CloudWatch Alarm (missed heartbeat) ──▶ SNS ──▶ owner   # dead-man's
   cold start. This is the v1 default since we don't scrape in v1.
 - **Container image** (up to 10GB) only if a later phase needs Playwright/Chromium. Don't
   reach for it prematurely.
-- Runtime Python 3.12, arm64 (cheaper). Set a generous timeout (e.g., 120s) and modest memory
-  (256–512MB); the work is I/O-bound.
+- Runtime Python 3.12, arm64 (cheaper). Modest memory (256–512MB); the work is I/O-bound. See
+  "Lambda timeout" below for the real, measured reasoning behind the configured timeout --
+  don't pick one by guessing.
+
+## Standing rule: always override the CLI's read timeout on a manual invoke
+
+**Every manual `aws lambda invoke` against this function must pass `--cli-read-timeout` set
+comfortably above the Lambda's currently configured `lambda_timeout` (300s as of 2026-07-19 --
+check `infra/variables.tf` if that's changed since), e.g. `--cli-read-timeout 400`.** The AWS
+CLI's own default read timeout (botocore's `DEFAULT_TIMEOUT`, 60s, unless overridden in
+`~/.aws/config`) is shorter than realistic real execution time for this poller. Without an
+explicit override, a slow invoke doesn't just wait longer or fail cleanly -- the CLI silently
+fires a brand-new real `Invoke` call via its own retry logic once its 60s read timeout
+expires, while the FIRST invocation keeps running server-side, completely unaware the client
+gave up. Each retry is a fully independent real run against real APIs, invisible to whoever
+ran the command -- there is no warning, no combined error, just what looks like one slow
+command. This bit us for real in production (see below): one `aws lambda invoke` produced at
+least 5 real invocations, each burning real SerpApi budget, before anyone realized it wasn't
+one call. **This is a standing rule for every future manual invoke of this function, not a
+one-off fix for the 2026-07-19 incident** -- it applies regardless of what the configured
+timeout becomes later; just keep the override comfortably above whatever `lambda_timeout`
+currently is.
+
+## Lambda timeout (real measurement, not a guess -- confirmed 2026-07-19)
+
+**The original 120s default was never measured against a real run, and it was wrong: the
+deployed Lambda's own real invocations confirmed it via repeated production failures.**
+CloudWatch Logs for `/aws/lambda/flight-tracker-app-poller` showed at least 5 separate real
+invocations within a ~13-minute window (`bb7730ec`, `e69b94d6`, `170ee636`, `b553598f`, plus a
+5th) each ending `REPORT ... Duration: 120000.00 ms ... Status: timeout` -- every one killed by
+the Lambda's own execution timeout with zero completed output (no digest, no confirmed
+alert-vs-no-alert outcome), while still spending real SerpApi budget on whatever calls it
+reached before being killed. **Also confirmed from that same log evidence: the multiple
+invocations were the AWS CLI's own client-side retry behavior, not several manual re-runs.**
+New log streams appeared roughly every 57-60 seconds -- shorter than the 120s function
+timeout itself, meaning a NEW real invocation started while the PREVIOUS one was still
+genuinely running server-side. This matches botocore's default `read_timeout`
+(confirmed via `botocore.endpoint.DEFAULT_TIMEOUT` on the installed version: 60s, with no
+override in this project's `~/.aws/config`) being shorter than the Lambda's configured 120s
+timeout: the CLI gives up waiting for an HTTP response at 60s and retries with a brand-new
+`Invoke` call, even though the server-side execution from the FIRST call is still in flight
+and completely unaware the client stopped waiting -- Lambda has no way to cancel an
+in-flight synchronous invocation just because the caller's socket read timed out. One log
+stream even shows two full `START`/`END`/`REPORT` (each `Status: timeout`) cycles back to
+back on the same warm container -- direct confirmation of two separate real `Invoke` calls
+landing within about a minute of each other. **The fix for this half of the problem is
+operational, not code**: when manually invoking this Lambda in the future, pass a client-side
+timeout override at least as long as the Lambda's own configured timeout (e.g.
+`aws lambda invoke --cli-read-timeout 400 ...` once the timeout below is applied), or expect
+the CLI to silently multiply real invocations (and real API spend) on any run slower than 60s.
+
+**Real measurement, taken locally (not via the Lambda) specifically to avoid burning more
+real budget while diagnosing this:** `scripts/dry_run.py --route "DC → Italy"` (the smaller
+of the two active `watchlist.yaml` routes) completed in **0.74s** (18 candidates, 1 seats.aero
+Cached Search call, 0 real SerpApi calls needed this run). `scripts/dry_run.py --route
+"DC → Europe (broad)"` (the larger route, 8 destinations) completed in **64.26s** (3,937
+candidates seen, 8 Cached Search + 3 Get Trips + 99 real SerpApi weekly-baseline + 3
+exact-date-confirm calls -- all 99 distinct route/cabin/week buckets touched this run were
+genuine real calls, not served from a pre-existing local cache, confirmed by cross-checking
+that every one of the 99 distinct buckets logged a `REFRESHED` line, not just a `CACHED` one).
+**Combined, a full watchlist real-time-mode pass (both routes, matching what one default
+Lambda invocation actually loops through) measured ~65 seconds total, with zero real
+timeouts hit during this particular run.**
+
+**Two real, known gaps mean 65s understates the true production worst case -- do not treat it
+as the ceiling:**
+
+1. **State store latency.** `scripts/dry_run.py` uses a local JSON file (`FileStateStore`) for
+   dedup/baseline reads -- effectively free, in-process. Production's `DynamoStateStore` makes
+   a REAL DynamoDB round trip (`get_baseline`/`already_alerted`) per candidate reaching those
+   checks -- 2,166 real candidates had cash data computed in the measured run alone. Real
+   DynamoDB latency per call is typically single-digit-to-low-tens of milliseconds, but
+   multiplied across thousands of candidates that adds real seconds the local run's numbers
+   don't include at all.
+2. **Occasional real SerpApi read-timeouts.** `src/providers/cash/serpapi.py`'s client has a
+   20s `httpx` timeout; the module's own docstring (and this incident's own CloudWatch
+   evidence -- the very first failed invocation's traceback was a real `httpx.ReadTimeout` on
+   an IAD-FCO 2027 (year-out) query) confirms these are real and more likely on far-future
+   dates. The clean local measurement above hit zero of these; production, across enough real
+   runs, will not always be so lucky -- each occurrence costs up to the full 20s.
+
+**First raise: `lambda_timeout` (`infra/variables.tf`) 120s -> 300s.** Rationale at the time:
+~4.6x the measured 65s clean baseline, enough headroom to comfortably absorb the two known
+gaps above even under a pessimistic reading (real DynamoDB overhead across thousands of
+per-candidate calls, plus a handful of real 20s timeouts in one run), while staying well under
+Lambda's hard 900s/15-minute ceiling and leaving a full 15 minutes of margin before the next
+scheduled invocation (`watchlist.yaml`'s `schedule.award_cached_minutes: 20`) even in that
+worst case. Lambda bills actual execution duration, not the configured timeout, so this costs
+nothing extra unless the function genuinely needs the room. **This number was tied to the
+watchlist's fan-out at measurement time, not a universal constant -- and that fan-out changed
+again the same session, superseding it almost immediately (see below).**
+
+**Second raise, same day: 300s is now itself stale -- 300s -> 800s.** The 65s/300s figures
+above were measured while both active routes were still **economy-only**; business/first were
+re-added immediately afterward (see `deal-valuation`'s premium-cabin-prefilter section), which
+triples the cabin fan-out per route. A real steady-state cost-measurement run right after that
+change ("Run 1," `scripts/dry_run.py` across both routes, matching what one default Lambda
+invocation actually loops through) measured:
+
+- `DC → Italy`: **155.22s** (22 candidates, 1 Cached Search + 0 Get Trips, 0 real SerpApi calls
+  -- every candidate was a far-future 2027 date that skipped or timed out before any cash call
+  completed, same pattern the original 65s measurement also hit for this route).
+- `DC → Europe (broad)`: **465.08s** (4,813 candidates, 8 Cached Search + 12 Get Trips, 159
+  weekly-baseline + 12 exact-date-confirm = **171 real SerpApi calls**, 8 real alerts sent --
+  the full `max_alerts_per_run` cap, exhausted by ONE repeating flat-rate Aeroplan business
+  chart across near-duplicate dates, see `deal-valuation`'s group-winner-selection finding --
+  and 91 more genuinely-qualifying candidates capped afterward).
+- **Combined: 620.30s total** -- roughly 9.5x the old economy-only baseline, driven by the 3x
+  cabin fan-out plus, this time, real Get-Trips/exact-confirm calls the old measurement never
+  exercised at all (it sent zero alerts, so never reached those calls).
+
+`lambda_timeout` raised again to **800s**: ~1.3x the measured 620.3s (a much tighter multiplier
+than the first raise's ~4.6x, deliberately -- see below), staying under Lambda's 900s hard
+ceiling with 100s to spare, and leaving **~6.7 minutes** of margin before the next 20-minute
+scheduled invocation (down from ~15 minutes at 300s -- a real, tighter margin, not hidden).
+**Group-winner selection** (built the same session this 620.3s number was measured, see
+`deal-valuation`) is expected to *reduce* real Get-Trips/exact-confirm call volume going
+forward -- Run 1's own log shows the entire 8-alert cap was consumed by repeating dates of one
+deal, exactly what grouping now collapses to a single winner before those calls are ever
+spent. 800s is chosen as a safe ceiling for the measured pre-grouping worst case, not a number
+this route is expected to need in full once grouping's real effect is confirmed by a fresh
+measurement. **Re-measure with grouping active (see `SESSION_HANDOFF.md`'s next steps) before
+tuning either the cap or this timeout any further** -- this number, like the one before it, is
+tied to the watchlist's fan-out and pipeline behavior at measurement time, not a universal
+constant.
 
 **Packaging gotcha: cross-platform wheels, not the host machine's.** Building the
 deployment zip on a Mac (or any non-Lambda platform) with a plain `pip install --target`
@@ -61,6 +184,32 @@ image against the built zip (`public.ecr.aws/lambda/python:3.12-arm64`) and impo
 dependency before ever deploying it — a static architecture check confirms the binary
 *format* is right, not that it actually *runs* cleanly inside the runtime (missing shared
 libs, glibc mismatches, etc. wouldn't show up in a static check).
+
+**Confirmed 2026-07-19, FIXED the same day (not a lingering open issue): the build used to be
+non-reproducible, so `source_code_hash` used to be an untrustworthy "did anything really
+change" signal.** Rebuilding `dist/poller.zip` from the exact same
+`src/`/`watchlist.yaml`/dependency inputs, three times in a row with zero code changes between
+runs, originally produced **three different outer zip hashes** (`filebase64sha256`, what
+`lambda.tf`'s `source_code_hash` attribute is computed from). Confirmed this was pure packaging
+noise, not real content drift: extracting two of those builds and diffing every one of the
+2,386 individual files' own content hashes showed **zero differences** — same file count,
+byte-identical content on every single file. The non-determinism lived entirely in the zip
+container's own metadata (per-file mtimes, stamped at whatever wall-clock moment `pip
+install`/`cp` happened to run during that particular build) — the old `zip -X` invocation
+stripped extra file attributes (uid/gid) but did not neutralize per-entry timestamps or entry
+order.
+
+**The fix, applied to `scripts/build_lambda_package.sh` the same day:** `find "$BUILD_DIR" -exec
+touch -t 202001010000 {} +` stamps every file to one fixed mtime before zipping, and `find . -type
+f | sort | zip -X -q "$ZIP_PATH" -@` (replacing `zip -r .`) feeds entries in a fixed sorted
+order rather than relying on directory-read order. **Verified, not just theorized:** three
+consecutive rebuilds from unchanged inputs produced the identical SHA256 every time, and two of
+those builds were confirmed byte-for-byte identical via `cmp`. A `terraform plan` run
+immediately after now shows `source_code_hash` changing exactly once when the underlying code
+actually changes, and NOT changing again on a pure rebuild with no code changes — the property
+this whole fix exists for. If a future `terraform plan` ever again shows `source_code_hash`
+churn with no real `src/`/`watchlist.yaml` change, treat that as a regression in this fix (e.g.
+a future edit to the build script reintroducing an unstamped file), not as expected behavior.
 
 ## Scheduling
 

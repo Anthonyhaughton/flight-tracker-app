@@ -66,7 +66,12 @@ routes:
     # No `origins:` override -- falls back to the top-level [IAD] above,
     # which already matches what this route wants.
     destinations: [FCO]
-    cabins: [economy]
+    # business/first re-added 2026-07 alongside economy -- the free
+    # premium_cabin_max_multiplier prefilter below (awards section) rejects
+    # an obviously-bad premium-cabin candidate before it ever costs a real
+    # cash lookup, so re-adding these cabins doesn't reopen the pre-economy
+    # unvalidated-threshold problem (see deal-valuation).
+    cabins: [economy, business, first]
     date_window:
       # Narrow ~2-week bracket around 2027-07-07, expressed as an offset
       # from today (2026-07-18 at the time this was set) so it stays
@@ -92,7 +97,7 @@ routes:
     # volume, or a dedicated, budget-scoped test run of BWI specifically has
     # established its real density.
     destinations: [LHR, CDG, AMS, FRA, ZRH, LIS, BCN, CPH]
-    cabins: [economy]
+    cabins: [economy, business, first]
     date_window:
       # Same ~150-day rolling window as before -- this route is inspiration
       # search, not the 2027-specific DC -> Italy trip above.
@@ -123,8 +128,11 @@ awards:
   # ever mattered. 250 was the more consequential of the two threshold
   # changes; the CPP floor (below) remained the harder constraint even at
   # 2.0, since real median CPP on that same data was ~0.8-0.83, nowhere near
-  # either 2.0 or 2.5. Global, not per-route, since both active routes are
-  # economy and there's no route left needing the old business/first numbers.
+  # either 2.0 or 2.5. Global, not per-route -- both active routes shared
+  # this floor when it was validated against economy-only data; business/
+  # first were re-added 2026-07 alongside economy (not in place of it), with
+  # premium_cabin_max_multiplier below as the free sanity check that stops
+  # an obviously-bad premium-cabin candidate before this floor even applies.
   min_trip_value_usd: 250
   cpp_floors:                          # cents-per-point required to alert, per program
     # 2.0 (previously 2.5). Same 2026-07-18 real-data validation as
@@ -152,6 +160,43 @@ awards:
     united:          2.0
     default:         2.0   # covers every other eligible_programs entry (aeromexico, delta, emirates,
                             # jetblue, qantas, singapore, lifemiles) that has no explicit override above.
+
+  # Free (no cash lookup spent) sanity check on a business/first candidate:
+  # reject if its miles cost exceeds this multiplier times economy's miles
+  # cost on the SAME seats.aero record -- both cabins' costs are present on
+  # one Cached Search row, confirmed via a real live call (2026-07), so this
+  # costs nothing extra. Only applies to business/first (re-added 2026-07
+  # alongside economy, see routes above); economy candidates are unaffected.
+  # See src/valuation.py's passes_award_prefilter.
+  premium_cabin_max_multiplier: 2.0
+
+  # Per-program transfer bonus, as a fraction (0.25 = 25%). Manually
+  # maintained here -- NO automated fetching of any kind, since transfer
+  # bonuses are promotional and time-limited; update/revert this by hand
+  # when a real bonus is running. Purely informational: when nonzero, alerts
+  # and the weekly digest show an "effective cost" annotation
+  # (miles / (1 + bonus)) alongside the real miles number -- this never
+  # changes any gating/threshold decision (see src/valuation.py's
+  # compute_transfer_bonus_effective_miles). Every eligible_programs entry
+  # listed at 0.0 (no bonus) by default; only edit the specific program(s)
+  # with a real, currently-running bonus.
+  transfer_bonus_pct:
+    aeromexico:      0.0
+    aeroplan:        0.0
+    british:         0.0
+    flyingblue:      0.0
+    delta:           0.0
+    emirates:        0.0
+    iberia:          0.0
+    jetblue:         0.0
+    qantas:          0.0
+    singapore:       0.0
+    virginatlantic:  0.3   # Amex Membership Rewards 30% transfer bonus, confirmed active
+                            # 2026-07-19, expires 2026-07-31 -- revert to 0.0 after that date
+                            # unless renewed. Chase's parallel 30% bonus to this program already
+                            # expired 2026-07-14 -- not currently applicable.
+    united:          0.0
+    lifemiles:       0.0
 
 # --- cash drop detection ---
 cash:

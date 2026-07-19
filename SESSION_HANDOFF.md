@@ -7,128 +7,102 @@ file to reflect everything below.
 
 ## Current state
 
-**Deployed to production: v1.0 only — award-only, business/first cabin, no cash
-integration, the original thresholds, no `eligible_programs` filter.** The EventBridge
-schedule has **never been enabled** at any point in this project's history — the Lambda has
-never fired on its own, only via manual invokes during v1.0 verification.
+**Deployed to real AWS: still v1.0 + v1.1 + v1.1.1 + v1.2, unchanged since the last session.**
+Nothing from this session has been applied to real infrastructure yet — see CLAUDE.md's
+"Current deploy status" for the full, current picture. Everything below is local code/config
+state: built, tested (261 tests, all green), Terraform plans reviewed where applicable, but
+not deployed.
 
-**Built, tested, and locally live-verified — but never deployed:** everything from v1.1
-through v1.1.1. That includes real cash integration (SerpApi, baselines, exact-date confirm),
-the `eligible_programs` reward-transfer-partner filter, the pivot of both active routes to
-economy cabin, a real-data-recalibrated `cpp_floor`/`min_trip_value_usd` (2.0/$250, down
-from thresholds implicitly tuned for a different cabin), the removal of a real
-alert-fatigue safety issue (a permissive cash-outage fallback that used to make a
-cash-provider outage produce *more* alerts, not fewer), and a refactor that unified
-`poll_route()`'s and `scripts/dry_run.py`'s per-candidate logic into one shared
-`evaluate_candidate()` function (with an object-identity test preventing future drift — see
-the `avoiding-duplicate-implementations` skill). A `terraform plan` for all of this has been
-reviewed and is clean (source-code-hash-only diff) but **has not been applied**.
+**This session's real, completed work (all local, none applied):**
 
-**Built and tested — but NOT yet live-verified, and never deployed: v1.2, the weekly
-digest.** `src/digest.py`'s `build_weekly_digest()` implements the full confirmed spec —
-snapshot-at-digest-time ranking across every active route, two independent top-5 rankings
-(cash-value, CPP) off the cheap weekly-bucketed cash estimate, exactly one real exact-date
-confirm call per DISTINCT finalist (deduped across both lists, never per-list), and an
-always-sends guarantee (an honestly empty digest, or a "closest miss" message, when nothing
-clears the real-time bar). It deliberately does NOT call `evaluate_candidate()` — a "shared
-lower layer, different upper orchestration" case (see `avoiding-duplicate-implementations`):
-the shared valuation math (`passes_award_prefilter`, `compute_effective_cpp`, `is_high_value`,
-`get_or_refresh_baseline`, `confirm_exact_date_price`) is imported and called directly, not
-re-derived. Wired into `lambda_handler` via `{"mode": "digest"}` (every other event is
-provably unchanged — see `test_lambda_handler_default_path_is_byte_for_byte_unchanged`) and
-into `scripts/dry_run.py --mode digest`. `Notifier.send_digest()` implemented on both
-`DiscordNotifier` (two embeds: Top Cash Value, Top CPP) and `TelegramNotifier` (one
-MarkdownV2 message, two sections). 18 new tests, all mocked; full suite (208 tests) green.
-**This is a step earlier than v1.1/v1.1.1 above**: `--mode digest` has only been
-smoke-tested with a fake key (confirmed it reaches a real seats.aero call and fails loudly on
-auth — proof the wiring is live, not proof the ranking output is sane against real data). See
-"Next concrete task" below.
+1. **Heartbeat namespace bug — fixed.** `src/poller.py`'s `HEARTBEAT_NAMESPACE` corrected to
+   `"flight-tracker-app/Heartbeat"`; `infra/iam.tf`'s Heartbeat condition reverted to reference
+   `local.heartbeat_namespace` directly. A reviewed `terraform plan` shows the expected
+   `source_code_hash` change and, notably, zero diff on the IAM condition itself — real AWS
+   already had the correct value the whole time (the earlier "stopgap" was only ever an
+   uncommitted local file edit, never actually applied — see
+   `avoiding-duplicate-implementations`).
+2. **Lambda zip build made reproducible** — `scripts/build_lambda_package.sh` now stamps fixed
+   mtimes and sorts entries before zipping; verified via three identical rebuilds. See
+   `aws-serverless-deploy`.
+3. **`lambda_timeout` raised twice: 120s → 300s → 800s.** The 300s figure was based on a real
+   65s measurement against an economy-only watchlist; business/first were re-added the SAME
+   session (tripling cabin fan-out), and a fresh real measurement immediately after ("Run 1",
+   see below) came back at 620.3s total — 800s is the current, up-to-date figure. See
+   `aws-serverless-deploy`'s "Lambda timeout" section for the full two-measurement history.
+4. **Premium-cabin re-add + free sanity prefilter** (`premium_cabin_max_multiplier`, default
+   2.0) — business/first back on both routes alongside economy, with a free (no cash lookup)
+   rejection of an obviously-bad premium-cabin candidate. See `deal-valuation`.
+5. **`transfer_bonus_pct` annotation** (informational only, never gates anything) —
+   `watchlist.yaml`'s `virginatlantic` entry is currently **0.3** (confirmed active
+   2026-07-19, expires 2026-07-31, see that file's own comment); every other eligible program
+   is still 0.0, unresearched, not confirmed zero. **This is a `watchlist.yaml` change and
+   therefore ships in the next Lambda zip rebuild — it is not live in the deployed Lambda
+   until that rebuild+deploy happens**, same as any other code/config change.
+6. **Group-winner selection** — the largest piece of this session. Per (origin, destination,
+   cabin, program, calendar month) group, only the single highest-cpp candidate now reaches
+   dedup/cap/Get Trips/exact-confirm/notify; applied identically in the digest's ranking. See
+   `deal-valuation`'s full spec, including the real finding that motivated it: Run 1 (below)
+   showed the entire `max_alerts_per_run` cap consumed by ONE repeating flat-rate Aeroplan
+   award chart across near-duplicate dates. `evaluate_candidate()` was split into
+   `classify_candidate()`/`finish_award_candidate()` to make this possible.
 
-**One more real gap inside the current config itself:** the real `watchlist.yaml`'s
-`DC → Europe (broad)` route sets `origins: [IAD, BWI]`, but only `IAD` has ever actually been
-queried by anything — real API calls or local dry runs. `BWI` would go live untested the
-moment this deploys.
+**Real cost measurement, "Run 1" (2026-07-19, `scripts/dry_run.py` across both routes,
+PRE-grouping code):** `DC → Italy` 155.22s (22 candidates, 1 Cached Search + 0 Get Trips, 0
+real SerpApi calls — every candidate was a far-future 2027 date that skipped/timed out before
+any cash call completed). `DC → Europe (broad)` 465.08s (4,813 candidates, 8 Cached Search +
+12 Get Trips, 159 weekly-baseline + 12 exact-confirm = 171 real SerpApi calls, 8 real alerts
+sent — the FULL cap, all 8 the same flat-rate Aeroplan chart — and 91 more genuinely-qualifying
+candidates capped afterward). **Combined: 620.3s, 171 SerpApi calls total.** "Run 2" (meant to
+run ~20-25 minutes after Run 1, to characterize real steady-state cost with most cash buckets
+still warm) was explicitly cancelled mid-session before it started — never executed. Since
+this whole measurement predates group-winner selection, treat it as a useful pre-grouping
+data point, not the current steady-state baseline — see "Next concrete steps" below.
 
-Everything above is explained in full, with the real supporting data, in:
-- `CLAUDE.md`'s "Build phases" and "Current deploy status" sections (the authoritative
-  status summary).
-- `deal-valuation` skill: the `eligible_programs` design philosophy, the real validated
-  economy-cabin calibration data (median CPP, the Virgin Atlantic finding, and the Qantas
-  structurally-negative-value finding), the fallback-direction fix, and the weekly digest's
-  full implementation (ranking, dedup, always-sends guarantee).
-- `seats-aero-integration` skill: the finding that the live Concepts doc's Sources table is
-  not authoritative (British Airways / Iberia were absent from the doc but real in live
-  results).
-- `aws-serverless-deploy` skill: three real operational lessons from live testing (local
-  dry-run state vs. production DynamoDB state, verifying actual state after an interrupted
-  tool call, verifying real cost at the provider's dashboard rather than trusting a running
-  tally).
-- `avoiding-duplicate-implementations` skill: the general pattern behind the
-  `evaluate_candidate()` refactor, AND (its second real case) why the digest needed its own
-  orchestration instead of forcing `evaluate_candidate()` to serve a shape it wasn't built for.
+**BWI's exclusion from `DC → Europe (broad)`'s origins — still the right call, not
+re-confirmed against the current scope.** The original removal (see `watchlist.yaml`'s own
+comment) was justified against an economy-only cost projection; business/first have since
+tripled per-route cabin fan-out, so BWI's real incremental cost if ever re-added is higher
+than that original estimate, not lower. The decision itself likely still holds (if anything,
+more strongly) — but nobody has explicitly re-run that reasoning against the current 3-cabin
+scope. Open, not urgent, not blocking.
 
-## Next concrete task: one real live-data run of the digest
+**Both EventBridge schedules exist in real AWS and remain confirmed `DISABLED`** —
+`award-cached-poll` and `digest-weekly` — unchanged this session, verified via `terraform
+state show` in an earlier session. **Neither should be enabled until every item in "Next
+concrete steps" below is confirmed clean** — v1.2.1 hasn't even been applied yet.
 
-This is next because everything else about v1.2 is done except the one thing that can't be
-verified with mocks: whether the ranking output looks sane against real seats.aero/SerpApi
-data, and whether the real call volume matches what was designed (bounded, cache-first
-weekly-baseline lookups plus at most 10 real exact-date confirms). This mirrors exactly how
-v1.1 was live-verified via `scripts/dry_run.py` before v1.1.1 was ever built on top of it —
-same discipline, same script, new `--mode`.
+## Next concrete steps, in order
 
-**Run:**
+1. **Confirm BWI's status.** Re-run the origins-inclusion cost reasoning against the CURRENT
+   3-cabin (economy + business + first) scope, not the economy-only numbers the original
+   deferral was based on. Likely conclusion: still exclude it, now with a stronger/updated
+   justification — but don't assume that without redoing the math against real current
+   fan-out.
+2. **Confirm/apply the `transfer_bonus_pct.virginatlantic` update.** It's live in
+   `watchlist.yaml` (0.3, expires 2026-07-31) but not yet in the deployed Lambda — it needs a
+   zip rebuild + real deploy (alongside everything else in this session, since all of it ships
+   in the same package) to actually take effect in production, and a reminder to revert it to
+   0.0 after 2026-07-31 if the promo isn't renewed.
+3. **Re-run Run 1/Run 2 (steady-state cost measurement) now that grouping is built.** The old
+   Run 1 numbers (620.3s, 171 SerpApi calls) predate group-winner selection and are expected to
+   overstate real cost going forward — Run 1's own log showed the ENTIRE alert cap consumed by
+   one repeating flat-rate chart, exactly the case grouping now collapses to one winner before
+   Get Trips/exact-confirm are ever spent. A fresh Run 1 (cold-ish) + Run 2 (~20-25 min later,
+   most buckets still warm) pair, with grouping active, is what actually answers "what does
+   real steady-state polling cost now" — the old numbers shouldn't be trusted for that
+   question anymore.
+4. **THEN reconsider `max_alerts_per_run` (currently 8) with accurate numbers.** Only after
+   step 3's fresh measurement — tuning the cap against pre-grouping numbers (where one program
+   could exhaust it alone) would be tuning against a problem grouping already fixes, not the
+   real remaining shape of the data.
+5. **Real-time schedule (`award-cached-poll`) stays `DISABLED` until 1-4 above are all
+   confirmed clean.** This is in addition to, not instead of, the still-pending heartbeat fix
+   deploy: even once BWI/transfer-bonus/cost/cap are all settled, `terraform apply` +
+   `terraform plan` review is still a separate, deliberate step, and enabling either schedule
+   is its own later decision after that (see `aws-serverless-deploy`'s two-phase-apply
+   discipline).
 
-```
-python scripts/dry_run.py --mode digest
-```
-
-**What a successful run should confirm** (see `scripts/dry_run.py`'s own pre-flight log line
-for the exact call-count bound before it runs):
-
-- Real Cached Search hits across every active route, at the exact call count the pre-flight
-  estimate predicted (deterministic: origins × destinations, summed across active routes).
-- The weekly-baseline SerpApi call count is small and cache-first — most candidates sharing a
-  route/cabin/ISO-week bucket should NOT each cost a separate call.
-- At most 10 real exact-date-confirm calls, and fewer than 10 if the two top-5 lists overlap
-  (check the log — this is the thing a mocked test can assert but can't prove against real
-  data volume/shape).
-- A real Discord message lands with two sections (Top Cash Value, Top CPP) and sane-looking
-  numbers — or, if nothing clears the real-time bar this week, an honest "closest was
-  X.Xcpp" message, not silence and not a crash.
-- If the real run instead turns up an honestly-empty digest (no candidates ranked at all),
-  that's a valid, useful outcome too — it's a signal about current real availability, not a
-  bug, the same way a quiet real-time run is normal on most weeks (see `deal-valuation`).
-
-**After this run succeeds:** v1.2 moves to the same status tier v1.1.1 already sits at
-(built, tested, locally live-verified, never deployed) — update `CLAUDE.md`'s v1.2 bullet
-accordingly. Deploying is a separate, later decision — see below.
-
-## The other pending decision: closing the deploy gap
-
-Independent of the digest work above — whenever it's time to actually ship v1.1/v1.1.1 to
-production, mirror the v1.0 two-phase pattern (`aws-serverless-deploy`):
-
-1. `terraform apply` the already-reviewed plan (Lambda `source_code_hash` update only,
-   `schedule_enabled` stays `false`).
-2. Verify with a real manual Lambda invoke — confirm the new code path (cash gating,
-   `eligible_programs`, economy cabin, the corrected fallback behavior) behaves correctly
-   against real production DynamoDB state, not just `scripts/dry_run.py`'s local JSON state
-   (these are genuinely separate stores — see `aws-serverless-deploy`'s live-testing
-   lessons).
-3. Only then apply again with `schedule_enabled = true`.
-
-Before step 2 specifically: assume a **fully cold cache** for the real DynamoDB baselines
-table when estimating that first invoke's API call cost — local dry-run testing, however
-extensive, has never touched the real DynamoDB tables and will not have warmed them at all.
-
-**v1.2's deploy gap is a step further back than v1.1/v1.1.1's:** there is no reviewed
-Terraform plan for the digest at all yet — the second EventBridge schedule (weekly cadence,
-`{"mode": "digest"}` payload, same Lambda) hasn't been drafted, let alone reviewed or applied.
-That work hasn't started and shouldn't, until the live-verification run above has actually
-happened — no reason to write infra for a ranking path that hasn't been checked against real
-data yet.
-
-This can happen before or after the digest's live-verification run above — they're
-independent decisions. If v1.1/v1.1.1 ships to production first, the digest work sits as
-*more* untested-in-production code on top of an already-undeployed-then-deployed base, which
-is fine, but worth being deliberate about rather than accidental.
+Everything above is explained in full, with the real supporting data, in `CLAUDE.md`'s "Build
+phases" (the new v1.2.1 entry) and "Current deploy status" sections, `deal-valuation`'s
+group-winner-selection section, and `aws-serverless-deploy`'s "Lambda timeout" section.

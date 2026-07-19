@@ -7,6 +7,7 @@ across both top-5 lists (never per-list, never per-candidate-seen)."""
 
 from __future__ import annotations
 
+import dataclasses
 import datetime
 
 from src.config import (
@@ -181,15 +182,25 @@ def test_digest_ranks_independently_and_confirms_only_distinct_union_of_finalist
     Call-count assertion: 1 ranking-phase call (shared bucket) + 6 distinct
     finalist confirms = 7 total. A version that confirmed EACH list's 5
     independently (no dedup on the B-E overlap) would produce 1 + 10 = 11 --
-    this test fails loudly on that regression."""
+    this test fails loudly on that regression.
+
+    Each award gets its OWN `program` (all still within the same ISO week,
+    so they keep sharing one cash-baseline bucket) specifically so
+    build_weekly_digest()'s group-winner selection (src/valuation.py's
+    select_group_winners, grouped by origin/destination/cabin/program/
+    calendar month) treats these 7 as independent groups rather than
+    collapsing them to a single winner -- this test is about ranking
+    genuinely distinct deals, not about the grouping mechanism itself (see
+    test_digest_excludes_premium_cabin_candidate_exceeding_multiplier_before_any_provider_call
+    and its neighbors for that)."""
     awards = {
-        "A": make_award(availability_id="A", date=datetime.date(2026, 5, 11), taxes_usd=100.0, miles=100000),
-        "B": make_award(availability_id="B", date=datetime.date(2026, 5, 12), taxes_usd=150.0, miles=20000),
-        "C": make_award(availability_id="C", date=datetime.date(2026, 5, 13), taxes_usd=200.0, miles=30000),
-        "D": make_award(availability_id="D", date=datetime.date(2026, 5, 14), taxes_usd=250.0, miles=40000),
-        "E": make_award(availability_id="E", date=datetime.date(2026, 5, 15), taxes_usd=300.0, miles=50000),
-        "F": make_award(availability_id="F", date=datetime.date(2026, 5, 16), taxes_usd=1900.0, miles=5000),
-        "G": make_award(availability_id="G", date=datetime.date(2026, 5, 17), taxes_usd=1990.0, miles=1000),
+        "A": make_award(availability_id="A", program="prog-a", date=datetime.date(2026, 5, 11), taxes_usd=100.0, miles=100000),
+        "B": make_award(availability_id="B", program="prog-b", date=datetime.date(2026, 5, 12), taxes_usd=150.0, miles=20000),
+        "C": make_award(availability_id="C", program="prog-c", date=datetime.date(2026, 5, 13), taxes_usd=200.0, miles=30000),
+        "D": make_award(availability_id="D", program="prog-d", date=datetime.date(2026, 5, 14), taxes_usd=250.0, miles=40000),
+        "E": make_award(availability_id="E", program="prog-e", date=datetime.date(2026, 5, 15), taxes_usd=300.0, miles=50000),
+        "F": make_award(availability_id="F", program="prog-f", date=datetime.date(2026, 5, 16), taxes_usd=1900.0, miles=5000),
+        "G": make_award(availability_id="G", program="prog-g", date=datetime.date(2026, 5, 17), taxes_usd=1990.0, miles=1000),
     }
     config = make_config()
     seats_client = FakeSeatsAeroClient(list(awards.values()))
@@ -224,8 +235,13 @@ def test_digest_ranks_independently_and_confirms_only_distinct_union_of_finalist
 def test_digest_selects_top_5_only_even_with_more_ranked_candidates():
     awards = [
         make_award(
-            availability_id=f"award-{i}", date=datetime.date(2026, 5, 11 + i), taxes_usd=100.0 + i * 10,
-            miles=50000,
+            # Distinct `program` per award (still same ISO week -> still one
+            # shared cash-baseline bucket) so group-winner selection treats
+            # these as 8 independent groups rather than collapsing them --
+            # see the docstring on test_digest_ranks_independently_and_
+            # confirms_only_distinct_union_of_finalists for the full reasoning.
+            availability_id=f"award-{i}", program=f"prog-{i}", date=datetime.date(2026, 5, 11 + i),
+            taxes_usd=100.0 + i * 10, miles=50000,
         )
         for i in range(8)  # 8 distinct candidates, all sharing one cash baseline bucket
     ]
@@ -246,6 +262,122 @@ def test_digest_selects_top_5_only_even_with_more_ranked_candidates():
         (e.trip_value_usd for e in result.cash_rank), reverse=True
     )
     assert [e.cpp for e in result.cpp_rank] == sorted((e.cpp for e in result.cpp_rank), reverse=True)
+
+
+def _make_config_tracking_premium_cabins(**overrides) -> WatchlistConfig:
+    """make_config()'s default route only tracks economy -- widen it to
+    include business/first so a premium-cabin-ratio test is actually
+    exercising the ratio check, not just getting rejected by the cabin
+    check first."""
+    base = make_config()
+    widened_route = dataclasses.replace(base.routes[0], cabins=["economy", "business", "first"])
+    return make_config(routes=[widened_route], **overrides)
+
+
+def test_digest_group_winner_selection_collapses_same_month_duplicates_to_one():
+    """4 same route/cabin/program candidates, different dates within the
+    SAME calendar month -- must collapse to a single ranked winner (the
+    highest-cpp one, d2 here -- cheapest miles at a fixed cash price), not
+    4 separate ranked entries competing for the top-5 lists. See
+    .claude/skills/deal-valuation's winner-selection spec."""
+    awards = [
+        make_award(availability_id="d1", date=datetime.date(2026, 8, 5), miles=100000),
+        make_award(availability_id="d2", date=datetime.date(2026, 8, 12), miles=40000),
+        make_award(availability_id="d3", date=datetime.date(2026, 8, 20), miles=80000),
+        make_award(availability_id="d4", date=datetime.date(2026, 8, 27), miles=120000),
+    ]
+    config = make_config()
+    seats_client = FakeSeatsAeroClient(awards)
+    cash_provider = FakeCashFareProvider(2000.0)
+    state = InMemoryStateStore()
+
+    result = build_weekly_digest(config, seats_client, cash_provider, state)
+
+    assert result.candidates_evaluated == 4
+    assert result.candidates_ranked == 1
+    assert len(result.cash_rank) == 1
+    assert len(result.cpp_rank) == 1
+    assert result.cash_rank[0].award.availability_id == "d2"
+    assert result.cpp_rank[0].award.availability_id == "d2"
+
+
+def test_digest_group_winner_selection_produces_separate_winners_across_months():
+    """Regression: collapsing an ENTIRE ~150-day window down to a single
+    winner per route would be too aggressive -- dates a month or more apart
+    are genuinely different trip options. Same route/cabin/program, one
+    qualifying date in August and one in October, must produce TWO ranked
+    entries, not one."""
+    august_award = make_award(availability_id="august-award", date=datetime.date(2026, 8, 10))
+    october_award = make_award(availability_id="october-award", date=datetime.date(2026, 10, 15))
+    config = make_config()
+    seats_client = FakeSeatsAeroClient([august_award, october_award])
+    cash_provider = FakeCashFareProvider(2000.0)
+    state = InMemoryStateStore()
+
+    result = build_weekly_digest(config, seats_client, cash_provider, state)
+
+    assert result.candidates_ranked == 2
+    ranked_ids = {e.award.availability_id for e in result.cash_rank}
+    assert ranked_ids == {"august-award", "october-award"}
+
+
+def test_digest_excludes_premium_cabin_candidate_exceeding_multiplier_before_any_provider_call():
+    """Same free sanity prefilter the real-time path applies -- a business/
+    first candidate whose ratio exceeds premium_cabin_max_multiplier must be
+    rejected before the digest ever spends a cash lookup on it."""
+    config = _make_config_tracking_premium_cabins()  # premium_cabin_max_multiplier defaults to 2.0
+    award = make_award(cabin="business", miles=88000, economy_miles=30000)  # 2.93x, over 2.0x
+    seats_client = FakeSeatsAeroClient([award])
+    cash_provider = FakeCashFareProvider(2000.0)
+    state = InMemoryStateStore()
+
+    result = build_weekly_digest(config, seats_client, cash_provider, state)
+
+    assert result.candidates_evaluated == 1
+    assert result.candidates_ranked == 0
+    assert result.cash_rank == []
+    assert result.cpp_rank == []
+    assert cash_provider.calls == []  # rejected before a cash lookup was ever spent
+
+
+def test_digest_ranks_premium_cabin_candidate_within_multiplier():
+    config = _make_config_tracking_premium_cabins()
+    award = make_award(cabin="business", miles=88000, economy_miles=60000)  # 1.47x, within 2.0x
+    seats_client = FakeSeatsAeroClient([award])
+    cash_provider = FakeCashFareProvider(2000.0)
+    state = InMemoryStateStore()
+
+    result = build_weekly_digest(config, seats_client, cash_provider, state)
+
+    assert result.candidates_ranked == 1
+
+
+def test_digest_entry_snapshots_transfer_bonus_pct_from_config():
+    base_config = make_config()
+    config = dataclasses.replace(
+        base_config, awards=dataclasses.replace(base_config.awards, transfer_bonus_pct={"aeroplan": 0.25}),
+    )
+    award = make_award()  # program="aeroplan", cabin="economy"
+    seats_client = FakeSeatsAeroClient([award])
+    cash_provider = FakeCashFareProvider(2000.0)
+    state = InMemoryStateStore()
+
+    result = build_weekly_digest(config, seats_client, cash_provider, state)
+
+    assert len(result.cash_rank) == 1
+    assert result.cash_rank[0].transfer_bonus_pct == 0.25
+
+
+def test_digest_entry_transfer_bonus_pct_defaults_to_zero_when_program_not_listed():
+    config = make_config()  # transfer_bonus_pct defaults to {}
+    award = make_award()  # program="aeroplan", not listed
+    seats_client = FakeSeatsAeroClient([award])
+    cash_provider = FakeCashFareProvider(2000.0)
+    state = InMemoryStateStore()
+
+    result = build_weekly_digest(config, seats_client, cash_provider, state)
+
+    assert result.cash_rank[0].transfer_bonus_pct == 0.0
 
 
 def test_digest_excludes_candidate_with_unknown_taxes_from_ranking():

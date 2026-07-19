@@ -1,18 +1,36 @@
 """Lambda entrypoint: orchestrates the v1.1 award + cash pipeline.
 
 seats.aero cached search -> cabin prefilter -> cash baseline lookup/refresh
-(week-bucketed) -> valuation gate (real CPP, once cash is available) ->
-dedup -> cap -> Get Trips detail -> exact-date cash confirm (one real
-SerpApi call, only for candidates that already cleared everything else) ->
-final valuation gate -> notifier alert -> record. There is no live-confirm
-step for AWARD space specifically: Live Search is commercial-partner-only
-and unavailable on a Pro account, so Get Trips (called only on candidates
-that already cleared the valuation gate) is the freshness/detail check
+(week-bucketed) -> first-pass valuation gate (real CPP, once cash is
+available) -> group-winner selection (see below) -> dedup -> cap -> Get
+Trips detail -> exact-date cash confirm (one real SerpApi call, only for
+the single winning candidate per group) -> final valuation gate ->
+notifier alert -> record. There is no live-confirm step for AWARD space
+specifically: Live Search is commercial-partner-only and unavailable on a
+Pro account, so Get Trips (called only on a group winner that already
+cleared the first-pass valuation gate) is the freshness/detail check
 instead. Cash gets its own two-stage version of the same idea: the cheap,
 week-bucketed baseline decides who's a candidate; a precise, exact-date
-call confirms the finalists, because day-of-week fare variance on
+call confirms the finalist, because day-of-week fare variance on
 long-haul business routes can be large enough that the week's bucket isn't
 accurate enough to be the number that actually gates a real alert.
+
+**Group-winner selection** (src/valuation.py's select_group_winners,
+.claude/skills/deal-valuation's winner-selection spec): before any
+first-pass-gate-passing candidate reaches dedup/cap/Get-Trips/confirm/
+notify, poll_route() groups this route's candidates by (origin,
+destination, cabin, program, calendar month) and keeps only the single
+highest-cpp candidate per group -- every other candidate in that group is
+dropped entirely (not sent, not counted as capped, not confirmed), so
+near-duplicate dates of one deal (e.g. the same business saver open on 4
+dates in the same month) never each independently spend a real Get Trips/
+exact-confirm call or compete for the per-run alert cap. Scoped to
+calendar MONTH, not the whole date window -- dates a month or more apart
+are genuinely different trip options and each get their own shot. The sent
+alert names the other qualifying dates it beat (Notifier.send_award_alert's
+group_other_dates), so that flexibility isn't silently hidden, just not
+spammed as separate messages. The SAME grouping is applied by
+src/digest.py before its own top-5 ranking, for the identical reason.
 
 The SAME cash baseline lookup also drives the second, independent trigger
 from deal-valuation: a standalone cash-price-drop alert, unrelated to any
@@ -35,6 +53,23 @@ One more config-driven gate, applied per candidate: `eligible_programs`
 -- a program not in the set is skipped before any cash lookup or Get Trips
 call). See src/valuation.py.
 
+A THIRD free prefilter, alongside those two: a business/first candidate
+whose miles cost exceeds `awards.premium_cabin_max_multiplier` times
+economy's miles cost on the SAME seats.aero record (both cabins' costs are
+present on one Cached Search row -- confirmed via a real live call, no
+second call needed, see AwardAvailability.economy_miles) is rejected before
+a cash lookup too. Both active routes now watch economy AND business/first
+(re-added 2026-07), so this exists specifically to stop an obviously-bad
+premium-cabin redemption from spending real SerpApi budget just to be
+rejected downstream anyway.
+
+Separately, `awards.transfer_bonus_pct` (per-program, manually maintained,
+default 0) is purely informational: when nonzero for the alerting award's
+program, the real-time alert and the weekly digest both show an
+"effective cost" annotation (miles / (1 + bonus)) alongside the real miles
+number -- see src/valuation.py's compute_transfer_bonus_effective_miles.
+It never changes any gating/threshold decision.
+
 A candidate with no resolved cash price -- a baseline lookup failure, a
 provider error, or a route with genuinely no cash data available -- always
 skips, on every route, unconditionally (src/valuation.py's is_high_value).
@@ -49,23 +84,28 @@ Origins are resolved per route: `route.origins` overrides the top-level
 Safe to retry: alerts are recorded only after a successful send, and dedup
 means a retried run re-evaluates rather than double-alerting.
 
-`evaluate_candidate()` is the ONE shared per-candidate decision pipeline --
-prefilter -> cash triggers -> first-pass gate -> dedup -> cap -> [caller
-fetches Get Trips + exact-date confirm via `fetch_trip`] -> final gate ->
-notify + record. poll_route() (below) and scripts/dry_run.py both call this
-SAME function for every candidate; neither reimplements it. The only thing
-that varies per caller is `fetch_trip`: fetching Get Trips detail and
-confirming the exact-date cash price are genuinely different per caller (
-production propagates a Get Trips failure loudly and swallows a confirm
-failure broadly; dry_run.py aborts loudly on auth/quota for either and
-treats a timeout as a skip of just that one candidate -- see each file's
-own `fetch_trip` implementation) -- that I/O + error-handling policy stays
-with the caller. Everything else -- the actual decision logic -- lives in
-evaluate_candidate() exactly once.
+`classify_candidate()` and `finish_award_candidate()` are the shared
+per-candidate decision pipeline, split into two phases specifically so
+group-winner selection can happen in between them: `classify_candidate()`
+(phase 1 -- cash triggers + first-pass gate, immediate, no deferral) is
+called for EVERY candidate; `select_group_winners()` then decides which
+fired candidates proceed; `finish_award_candidate()` (phase 2 -- dedup ->
+cap -> `fetch_trip` -> final gate -> notify + record) is called ONLY for
+each group's winner. poll_route() (below) and scripts/dry_run.py both call
+these SAME functions for every candidate; neither reimplements them. The
+only thing that varies per caller is `fetch_trip`: fetching Get Trips
+detail and confirming the exact-date cash price are genuinely different
+per caller (production propagates a Get Trips failure loudly and swallows
+a confirm failure broadly; dry_run.py aborts loudly on auth/quota for
+either and treats a timeout as a skip of just that one candidate -- see
+each file's own `fetch_trip` implementation) -- that I/O + error-handling
+policy stays with the caller. Everything else -- the actual decision
+logic, including grouping -- lives in these shared functions exactly once.
 """
 
 from __future__ import annotations
 
+import datetime
 import logging
 import os
 from dataclasses import dataclass
@@ -91,13 +131,24 @@ from src.providers.seats_aero import (
     select_trip_for_cabin,
 )
 from src.state import DynamoStateStore, StateStore, award_key, cash_key
-from src.valuation import Verdict, is_cash_below_mistake_fare_ceiling, is_cash_price_drop, is_high_value, passes_award_prefilter
+from src.valuation import (
+    Verdict,
+    compute_effective_cpp,
+    is_cash_below_mistake_fare_ceiling,
+    is_cash_price_drop,
+    is_high_value,
+    passes_award_prefilter,
+    select_group_winners,
+)
 
 logger = logging.getLogger("poller")
 
-# Matches infra/monitoring.tf's alarm namespace/metric -- keep these in sync
-# if the Terraform defaults change.
-HEARTBEAT_NAMESPACE = "flight-deal-agent/Heartbeat"
+# Matches infra/monitoring.tf's local.heartbeat_namespace ("${var.project_name}/Heartbeat")
+# and infra/iam.tf's Heartbeat statement condition -- keep all three in sync if the
+# project name or Terraform defaults change. (This constant was a stale pre-rename
+# string, "flight-deal-agent/Heartbeat", from 2026-07 until this fix -- see
+# avoiding-duplicate-implementations's "stale rename strings" section for the incident.)
+HEARTBEAT_NAMESPACE = "flight-tracker-app/Heartbeat"
 HEARTBEAT_METRIC = "PollSucceeded"
 
 
@@ -116,7 +167,17 @@ class PollStats:
     crossings is exactly the same kind of flood risk as many award
     candidates, so they share one budget. cash_alerts_sent is a subset of
     alerts_sent, tracked separately purely so the summary log can show the
-    award/cash split."""
+    award/cash split.
+
+    skipped_grouped_out is DISTINCT from skipped_capped and skipped_duplicate:
+    it counts a candidate that cleared the first-pass gate but lost to a
+    higher-cpp candidate in the SAME (origin, destination, cabin, program,
+    calendar month) group -- see select_group_winners() and finish_award_
+    candidate()'s callers. Never counted as capped (it never even reached
+    the cap check) and never as a duplicate (dedup never ran on it either) --
+    a distinct bucket so the run summary can tell "genuinely too many new
+    deals this run" apart from "multiple dates of the same deal, only the
+    best one was worth spending a real Get Trips/confirm call on"."""
 
     candidates_evaluated: int = 0
     alerts_sent: int = 0
@@ -124,6 +185,7 @@ class PollStats:
     skipped_duplicate: int = 0
     skipped_capped: int = 0
     skipped_other: int = 0
+    skipped_grouped_out: int = 0
 
 
 def _require_env(var_name: str, purpose: str) -> str:
@@ -165,20 +227,21 @@ class CloudWatchHeartbeat:
 @dataclass(frozen=True)
 class TripFetchResult:
     """Result of fetching Get Trips detail and (unconditionally, once
-    reached -- see evaluate_candidate's docstring) confirming the exact-date
-    cash price for a candidate that already cleared the first-pass gate,
-    dedup, and the cap. Produced by a caller-supplied `fetch_trip` callback
-    so each caller keeps its OWN error-handling policy for those two I/O
-    calls (see poll_route()'s and scripts/dry_run.py's own implementations)
-    -- exceptions that should abort the whole run (e.g. auth/quota failures)
-    must be allowed to propagate OUT of the callback uncaught; this type is
-    only for the "give up on evaluating this one candidate further" outcome.
+    reached -- see finish_award_candidate's docstring) confirming the
+    exact-date cash price for a candidate that already cleared the
+    first-pass gate, group-winner selection, dedup, and the cap. Produced
+    by a caller-supplied `fetch_trip` callback so each caller keeps its OWN
+    error-handling policy for those two I/O calls (see poll_route()'s and
+    scripts/dry_run.py's own implementations) -- exceptions that should
+    abort the whole run (e.g. auth/quota failures) must be allowed to
+    propagate OUT of the callback uncaught; this type is only for the
+    "give up on evaluating this one candidate further" outcome.
 
-    `skip_reason`, when set, is used as-is in place of evaluate_candidate's
-    own generic reason text -- lets a caller's callback (e.g. dry_run.py's
-    timeout handling) supply a more specific explanation without
-    evaluate_candidate needing to know about every possible I/O failure
-    mode a given caller might want to distinguish.
+    `skip_reason`, when set, is used as-is in place of finish_award_
+    candidate's own generic reason text -- lets a caller's callback (e.g.
+    dry_run.py's timeout handling) supply a more specific explanation
+    without finish_award_candidate needing to know about every possible I/O
+    failure mode a given caller might want to distinguish.
     """
 
     trips: list[dict] | None
@@ -199,7 +262,7 @@ class CashOutcome:
     fare: CashFare | None = None
     verdict: Verdict | None = None
     key: str | None = None
-    # True when evaluate_candidate (or the caller's own fetch_trip callback,
+    # True when classify_candidate (or the caller's own fetch_trip callback,
     # for a "capped" cash outcome this never applies to) already logged this
     # outcome itself -- lets a caller with its own verbose logging (e.g.
     # scripts/dry_run.py) skip re-logging what's already been said, without
@@ -215,8 +278,8 @@ class AwardOutcome:
     (scripts/dry_run.py) can log it directly rather than reconstructing
     their own message per skip reason.
 
-    `already_logged` is True when evaluate_candidate (or the caller's own
-    fetch_trip callback) already emitted a log line for this outcome --
+    `already_logged` is True when finish_award_candidate (or the caller's
+    own fetch_trip callback) already emitted a log line for this outcome --
     lets a caller with its own verbose logging skip re-logging it, without
     needing to enumerate which specific outcomes those are."""
 
@@ -229,57 +292,89 @@ class AwardOutcome:
 
 @dataclass(frozen=True)
 class CandidateResult:
-    """Both outcomes for one candidate, returned by evaluate_candidate() in
-    addition to its stats mutation -- poll_route() ignores this (it only
-    needs the stats side effect, matching its existing silent-aggregation
-    behavior); scripts/dry_run.py uses it for its own verbose per-candidate
-    logging and cost/distribution tracking, without needing a second copy
-    of the decision logic that produced it."""
+    """Both outcomes for one candidate -- poll_route() ignores this (it
+    only needs the stats side effect, matching its existing silent-
+    aggregation behavior); scripts/dry_run.py assembles it from
+    classify_candidate()'s ClassifyResult plus (for a group winner)
+    finish_award_candidate()'s AwardOutcome, for its own verbose
+    per-candidate logging and cost/distribution tracking, without needing a
+    second copy of the decision logic that produced either half."""
 
     award: AwardOutcome
     cash: CashOutcome
 
 
-def evaluate_candidate(
+@dataclass(frozen=True)
+class AwardFirstPassResult:
+    """The award side of classify_candidate()'s output -- the first-pass
+    (weekly-bucket-cash) gate check, computed but NOT yet acted on: no
+    dedup, no cap, no Get Trips, no exact-date confirm, no notify. `fired`
+    marks a candidate that cleared this gate and is therefore eligible for
+    group-winner selection (src/valuation.py's select_group_winners, see
+    poll_route()'s and scripts/dry_run.py's loops for how this composes
+    with finish_award_candidate() once grouping decides which fired
+    candidates actually proceed). `cpp` is the cheap first-pass weekly-
+    bucket estimate (0.0 and unused when not fired) -- exactly what
+    select_group_winners groups on, so grouping costs nothing new.
+
+    When `fired` is False, `reason` is a complete, already-decided skip
+    explanation; the caller finalizes it immediately -- a candidate that
+    never even matched the first-pass gate has no claim on group-winner
+    selection or the cap in the first place, grouped or not."""
+
+    award: AwardAvailability
+    route: RouteConfig
+    fired: bool
+    cpp: float
+    comparable_cash_usd: float | None
+    taxes_usd: float | None
+    reason: str
+
+
+@dataclass(frozen=True)
+class ClassifyResult:
+    """Both outcomes of classify_candidate(): the independent cash trigger
+    (fully resolved here -- never deferred or grouped, since it's about the
+    FARE observation, not any specific award redemption) and the award's
+    first-pass result (may still be pending group-winner selection)."""
+
+    cash: CashOutcome
+    award_first_pass: AwardFirstPassResult
+
+
+def classify_candidate(
     award: AwardAvailability,
     route: RouteConfig,
     config: WatchlistConfig,
     state: StateStore,
     notifier: Notifier,
     cash_update: CashBaselineUpdate | None,
-    fetch_trip: Callable[[AwardAvailability, float], TripFetchResult],
     *,
     max_alerts_per_run: int | None,
     stats: PollStats,
-) -> CandidateResult:
-    """The ONE shared per-candidate decision pipeline: prefilter -> cash
-    triggers (mistake-fare ceiling / relative drop) -> first-pass gate ->
-    dedup -> cap -> `fetch_trip` (caller-driven Get Trips + exact-date
-    confirm) -> final gate -> notify + record. Both poll_route() (below)
-    and scripts/dry_run.py call this SAME function for every candidate --
-    see this module's docstring for why `fetch_trip` is the one caller-
-    supplied extension point (I/O + error-handling policy for Get Trips and
-    the exact-date confirm genuinely differs per caller; everything else
-    does not and must not).
+) -> ClassifyResult:
+    """Phase 1 of the shared per-candidate decision pipeline (immediate, no
+    deferral): the independent cash trigger (mistake-fare ceiling / relative
+    drop) and the award's first-pass (weekly-bucket-cash) gate check. Does
+    NOT touch dedup/cap/Get-Trips/exact-confirm/notify for the AWARD side --
+    that's finish_award_candidate(), called only for the single highest-cpp
+    candidate in each (origin, destination, cabin, program, calendar month)
+    group, once select_group_winners() has decided who that is (see this
+    module's docstring and .claude/skills/deal-valuation's winner-selection
+    spec). Both poll_route() (below) and scripts/dry_run.py call this SAME
+    function for every candidate, then the SAME select_group_winners() and
+    finish_award_candidate() -- neither reimplements any of this.
 
     `cash_update` is the ALREADY-RESOLVED result of a baseline lookup (or
     None if no provider is wired up, or the lookup failed) -- callers do
     their OWN get_or_refresh_baseline() call, in their OWN try/except,
-    before calling this, for the same caller-specific-error-handling reason
-    `fetch_trip` is injected rather than called internally.
+    before calling this.
 
-    `fetch_trip` is called unconditionally once a candidate clears dedup
-    and the cap (not just "if comparable_cash_usd is not None" as an
-    earlier version had it) -- with the v1.0-style cabin-match-only
-    fallback retired, `verdict.fire` can only be True when
-    comparable_cash_usd was already resolved (see src/valuation.py's
-    is_high_value), so that conditional was dead code once the fallback
-    was removed; simplified away here as a direct, correctness-neutral
-    consequence of that fix, not a new behavior change.
-
-    Mutates `stats` in place (matches the existing PollStats contract) --
-    both callers already aggregate through a shared, mutable stats object
-    across a whole run.
+    Mutates `stats` in place for everything decided immediately here (the
+    cash trigger's outcome, and skipped_other for a candidate that doesn't
+    fire the first-pass gate at all) -- group-winner-selection-driven stats
+    (skipped_grouped_out, and everything finish_award_candidate() mutates)
+    are the CALLER's responsibility, after grouping.
 
     Does NOT check passes_award_prefilter -- that's deliberately the
     CALLER's responsibility, before the cash-baseline lookup even happens
@@ -351,17 +446,64 @@ def evaluate_candidate(
 
     if not verdict.fire:
         stats.skipped_other += 1
-        return CandidateResult(award=AwardOutcome(outcome="skipped", reason=verdict.reason), cash=cash_outcome)
+
+    # is_high_value's real implementation guarantees comparable_cash_usd/
+    # taxes_usd are non-None whenever fire=True -- this guard is defensive
+    # only (e.g. a test double for is_high_value that doesn't preserve that
+    # invariant), not a real production path.
+    cpp = (
+        compute_effective_cpp(comparable_cash_usd, award.taxes_usd, award.miles)
+        if verdict.fire and comparable_cash_usd is not None and award.taxes_usd is not None
+        else 0.0
+    )
+    first_pass = AwardFirstPassResult(
+        award=award, route=route, fired=verdict.fire, cpp=cpp,
+        comparable_cash_usd=comparable_cash_usd, taxes_usd=award.taxes_usd, reason=verdict.reason,
+    )
+    return ClassifyResult(cash=cash_outcome, award_first_pass=first_pass)
+
+
+def finish_award_candidate(
+    first_pass: AwardFirstPassResult,
+    other_dates: list[datetime.date],
+    config: WatchlistConfig,
+    state: StateStore,
+    notifier: Notifier,
+    fetch_trip: Callable[[AwardAvailability, float], TripFetchResult],
+    *,
+    max_alerts_per_run: int | None,
+    stats: PollStats,
+) -> AwardOutcome:
+    """Phase 2 of the shared per-candidate decision pipeline: dedup -> cap
+    -> `fetch_trip` (caller-driven Get Trips + exact-date confirm) -> final
+    gate -> notify (annotated with `other_dates`, see Notifier.
+    send_award_alert's group_other_dates kwarg) + record. Called ONLY for
+    the single highest-cpp candidate in its (origin, destination, cabin,
+    program, calendar month) group -- see select_group_winners() -- never
+    for a candidate that lost that selection (see this module's docstring
+    for why `fetch_trip` remains the one caller-supplied extension point).
+
+    `fetch_trip` is called unconditionally once a candidate clears dedup
+    and the cap (not just "if comparable_cash_usd is not None" as an
+    earlier version had it) -- with the v1.0-style cabin-match-only
+    fallback retired, `first_pass.fired` can only be True when
+    comparable_cash_usd was already resolved (see src/valuation.py's
+    is_high_value), so that conditional was dead code once the fallback
+    was removed; simplified away here as a direct, correctness-neutral
+    consequence of that fix, not a new behavior change.
+
+    Mutates `stats` in place (matches the existing PollStats contract) --
+    both callers already aggregate through a shared, mutable stats object
+    across a whole run.
+    """
+    award = first_pass.award
+    route = first_pass.route
+    comparable_cash_usd = first_pass.comparable_cash_usd
 
     key = award_key(award)
     if state.already_alerted(key):
         stats.skipped_duplicate += 1
-        return CandidateResult(
-            award=AwardOutcome(
-                outcome="skipped", reason=f"already alerted previously (duplicate), key={key}", key=key,
-            ),
-            cash=cash_outcome,
-        )
+        return AwardOutcome(outcome="skipped", reason=f"already alerted previously (duplicate), key={key}", key=key)
 
     # Cap check happens here -- after dedup (so it's independent of dedup,
     # per the design goal: dedup filters repeats across runs, this caps NEW
@@ -375,14 +517,11 @@ def evaluate_candidate(
             "%s matched but capped (max_alerts_per_run=%d reached this run), skipping send",
             award.availability_id, max_alerts_per_run,
         )
-        return CandidateResult(
-            award=AwardOutcome(
-                outcome="skipped",
-                reason=f"send cap ({max_alerts_per_run}) reached but candidate genuinely matched",
-                key=key,
-                already_logged=True,
-            ),
-            cash=cash_outcome,
+        return AwardOutcome(
+            outcome="skipped",
+            reason=f"send cap ({max_alerts_per_run}) reached but candidate genuinely matched",
+            key=key,
+            already_logged=True,
         )
 
     fetch_result = fetch_trip(award, comparable_cash_usd)
@@ -393,9 +532,7 @@ def evaluate_candidate(
         # nothing found) -- always treat as already logged.
         reason = fetch_result.skip_reason or "Get Trips returned nothing (space likely gone)"
         stats.skipped_other += 1
-        return CandidateResult(
-            award=AwardOutcome(outcome="skipped", reason=reason, key=key, already_logged=True), cash=cash_outcome,
-        )
+        return AwardOutcome(outcome="skipped", reason=reason, key=key, already_logged=True)
 
     # Get Trips returns itineraries across ALL cabins on this availability,
     # not just the one we matched -- trips[0] is not guaranteed to be (and
@@ -407,18 +544,14 @@ def evaluate_candidate(
         )
         logger.info("%s for %s", reason, award.availability_id)
         stats.skipped_other += 1
-        return CandidateResult(
-            award=AwardOutcome(outcome="skipped", reason=reason, key=key, already_logged=True), cash=cash_outcome,
-        )
+        return AwardOutcome(outcome="skipped", reason=reason, key=key, already_logged=True)
 
     if fetch_result.confirmed_cash_usd is None:
         reason = fetch_result.skip_reason or "no exact-date cash price to confirm the weekly-bucketed estimate"
         if fetch_result.skip_reason is None:
             logger.info("%s: %s, skipping", award.availability_id, reason)
         stats.skipped_other += 1
-        return CandidateResult(
-            award=AwardOutcome(outcome="skipped", reason=reason, key=key, already_logged=True), cash=cash_outcome,
-        )
+        return AwardOutcome(outcome="skipped", reason=reason, key=key, already_logged=True)
 
     # Re-run the gate with Get Trips' taxes AND the exact-date-confirmed
     # cash price above, not the weekly-bucketed one. Cached Search already
@@ -427,23 +560,22 @@ def evaluate_candidate(
     # against the more authoritative figures, which can differ (fresher
     # crawl / stale bucket). Skip rather than alert on a stale verdict.
     real_verdict = is_high_value(
-        award, config.awards, wanted_cabins,
+        award, config.awards, set(route.cabins),
         comparable_cash_usd=fetch_result.confirmed_cash_usd, taxes_usd=parse_trip_taxes_usd(trip),
     )
     if not real_verdict.fire:
         logger.info("%s no longer clears the gate with real numbers, skipping", award.availability_id)
         stats.skipped_other += 1
-        return CandidateResult(
-            award=AwardOutcome(
-                outcome="skipped", reason=real_verdict.reason, key=key, trip=trip, already_logged=True,
-            ),
-            cash=cash_outcome,
-        )
+        return AwardOutcome(outcome="skipped", reason=real_verdict.reason, key=key, trip=trip, already_logged=True)
 
-    notifier.send_award_alert(award, real_verdict, trip)
+    notifier.send_award_alert(
+        award, real_verdict, trip,
+        transfer_bonus_pct=config.awards.bonus_pct(award.program),
+        group_other_dates=other_dates,
+    )
     state.record_alert(key, ttl_seconds=config.alerts.dedup_ttl_days * 86400)
     stats.alerts_sent += 1
-    return CandidateResult(award=AwardOutcome(outcome="sent", reason=real_verdict.reason, key=key, trip=trip), cash=cash_outcome)
+    return AwardOutcome(outcome="sent", reason=real_verdict.reason, key=key, trip=trip)
 
 
 def poll_route(
@@ -490,6 +622,14 @@ def poll_route(
 
         return TripFetchResult(trips=trips, confirmed_cash_usd=confirmed_cash_usd)
 
+    # Phase 1: classify every candidate across this route's origins (cheap
+    # cash trigger + first-pass gate, see classify_candidate()) -- NOT yet
+    # dedup/cap/Get-Trips/confirm/notify for the award side. Collected here,
+    # not acted on per-award, specifically so group-winner selection (below)
+    # can see every fired candidate across the WHOLE route before any of
+    # them spends a real Get Trips/exact-confirm call.
+    classify_results: list[ClassifyResult] = []
+
     for origin in origins:
         try:
             hits = client.cached_search(origin, route.destinations, start, end, route.cabins)
@@ -520,9 +660,11 @@ def poll_route(
             # free) baseline lookup on an award we'd reject anyway -- Cached
             # Search is already scoped to route.cabins, so this rarely
             # actually filters anything out in practice, but it's a real
-            # skip when it does. Deliberately NOT inside evaluate_candidate
+            # skip when it does. Deliberately NOT inside classify_candidate
             # -- see that function's docstring for why.
-            if not passes_award_prefilter(award, wanted_cabins, config.eligible_programs):
+            if not passes_award_prefilter(
+                award, wanted_cabins, config.eligible_programs, config.awards.premium_cabin_max_multiplier,
+            ):
                 stats.skipped_other += 1
                 continue
 
@@ -548,10 +690,41 @@ def poll_route(
                         award.origin, award.destination, award.cabin, award.date, exc_info=True,
                     )
 
-            evaluate_candidate(
-                award, route, config, state, notifier, cash_update, fetch_trip,
-                max_alerts_per_run=max_alerts_per_run, stats=stats,
+            classify_results.append(
+                classify_candidate(
+                    award, route, config, state, notifier, cash_update,
+                    max_alerts_per_run=max_alerts_per_run, stats=stats,
+                )
             )
+
+    # Phase 2: group-winner selection -- prevents near-duplicate dates of
+    # one deal (same origin/destination/cabin/program/calendar month) from
+    # each independently spending a Get Trips + exact-confirm call and
+    # competing for the per-run alert cap. Scoped to this route's own
+    # candidates (across all its origins), not the whole multi-route run()
+    # invocation -- the real watchlist.yaml's active routes have disjoint
+    # destination sets, so this is behaviorally equivalent to a whole-run
+    # scope for the current config; see .claude/skills/deal-valuation's
+    # winner-selection spec for why per-route was chosen over restructuring
+    # run()'s cross-route contract for a difference that doesn't exist
+    # today. See select_group_winners() for the grouping/tie-break mechanism
+    # (identical to what src/digest.py applies before its own ranking).
+    fired = [r.award_first_pass for r in classify_results if r.award_first_pass.fired]
+    group_winners = select_group_winners(fired)
+    winner_ids = {id(first_pass) for first_pass, _ in group_winners}
+    for r in classify_results:
+        if r.award_first_pass.fired and id(r.award_first_pass) not in winner_ids:
+            stats.skipped_grouped_out += 1
+            logger.info(
+                "%s grouped out -- lost to a higher-cpp same-route/cabin/program/month candidate this run",
+                r.award_first_pass.award.availability_id,
+            )
+
+    for first_pass, other_dates in group_winners:
+        finish_award_candidate(
+            first_pass, other_dates, config, state, notifier, fetch_trip,
+            max_alerts_per_run=max_alerts_per_run, stats=stats,
+        )
 
     return stats
 
@@ -620,9 +793,9 @@ def run(
     heartbeat.emit()
     logger.info(
         "poll complete: %d candidate(s) evaluated, %d alert(s) sent (%d cash), %d skipped as duplicate, "
-        "%d skipped (cap reached)",
+        "%d skipped (cap reached), %d grouped out (lost to a same-route/cabin/program/month candidate)",
         stats.candidates_evaluated, stats.alerts_sent, stats.cash_alerts_sent,
-        stats.skipped_duplicate, stats.skipped_capped,
+        stats.skipped_duplicate, stats.skipped_capped, stats.skipped_grouped_out,
     )
     return stats.alerts_sent
 
@@ -639,11 +812,11 @@ def run_digest(
     real-client-construction/close pattern (same secrets, same real
     DynamoDB tables via the same env vars, same notifier-selection logic),
     but delegates the actual per-candidate ranking to src/digest.py's
-    build_weekly_digest() rather than poll_route()/evaluate_candidate().
-    See src/digest.py's module docstring for why the digest needs its own
-    orchestration instead of reusing evaluate_candidate() (different shape:
-    ranks everything and sends one aggregate message, no dedup, no
-    per-run cap).
+    build_weekly_digest() rather than poll_route()'s classify_candidate()/
+    finish_award_candidate() pair. See src/digest.py's module docstring for
+    why the digest needs its own orchestration instead of reusing those
+    (different shape: ranks everything and sends one aggregate message, no
+    dedup, no per-run cap).
 
     Deliberately does NOT emit the CloudWatch heartbeat run() emits: the
     heartbeat exists to distinguish "no alerts" from "the poller is dead" on

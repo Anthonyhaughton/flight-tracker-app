@@ -8,10 +8,19 @@ poller knowing or caring which one is active.
 send_cash_alert has no `deep_link` kwarg, unlike send_award_alert: CashFare
 (unlike AwardAvailability) already carries its own `deep_link` field, so
 there's nothing for the caller to supply separately.
+
+`group_other_dates` (empty/None by default) lists every OTHER date in the
+alerting award's (origin, destination, cabin, program, calendar month)
+group that also cleared the first-pass gate but lost to this one -- see
+src/valuation.py's select_group_winners and src/poller.py's
+finish_award_candidate. Both notifiers show an "+N other dates" annotation
+when non-empty, and nothing at all when empty -- flexibility isn't
+silently hidden, just not spammed as separate messages.
 """
 
 from __future__ import annotations
 
+import datetime
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -31,7 +40,14 @@ class Button:
 
 class Notifier(Protocol):
     def send_award_alert(
-        self, award: AwardAvailability, verdict: Verdict, trip: dict, *, deep_link: str | None = None
+        self,
+        award: AwardAvailability,
+        verdict: Verdict,
+        trip: dict,
+        *,
+        deep_link: str | None = None,
+        transfer_bonus_pct: float = 0.0,
+        group_other_dates: list[datetime.date] | None = None,
     ) -> None: ...
 
     def send_cash_alert(self, fare: CashFare, verdict: Verdict, baseline: Baseline | None) -> None: ...

@@ -22,7 +22,7 @@ from src.digest import DigestEntry, DigestResult
 from src.providers.cash.base import CashFare
 from src.providers.seats_aero import AwardAvailability, parse_trip_taxes_usd
 from src.state import Baseline
-from src.valuation import Verdict
+from src.valuation import Verdict, compute_transfer_bonus_effective_miles
 
 logger = logging.getLogger(__name__)
 
@@ -57,9 +57,19 @@ class DiscordNotifier:
         self._max_retries = max_retries
 
     def send_award_alert(
-        self, award: AwardAvailability, verdict: Verdict, trip: dict, *, deep_link: str | None = None
+        self,
+        award: AwardAvailability,
+        verdict: Verdict,
+        trip: dict,
+        *,
+        deep_link: str | None = None,
+        transfer_bonus_pct: float = 0.0,
+        group_other_dates: list[datetime.date] | None = None,
     ) -> None:
-        embed = format_award_embed(award, verdict, trip, deep_link=deep_link)
+        embed = format_award_embed(
+            award, verdict, trip, deep_link=deep_link, transfer_bonus_pct=transfer_bonus_pct,
+            group_other_dates=group_other_dates,
+        )
         self._send_embeds([embed])
 
     def send_cash_alert(self, fare: CashFare, verdict: Verdict, baseline: Baseline | None) -> None:
@@ -156,7 +166,15 @@ def _validate_and_clean_embeds(embeds: list[dict]) -> list[dict]:
     return cleaned
 
 
-def format_award_embed(award: AwardAvailability, verdict: Verdict, trip: dict, *, deep_link: str | None = None) -> dict:
+def format_award_embed(
+    award: AwardAvailability,
+    verdict: Verdict,
+    trip: dict,
+    *,
+    deep_link: str | None = None,
+    transfer_bonus_pct: float = 0.0,
+    group_other_dates: list[datetime.date] | None = None,
+) -> dict:
     """`trip` is one entry from SeatsAeroClient.get_trips(award.availability_id),
     already filtered to award.cabin by select_trip_for_cabin() in poller.py
     (Get Trips returns itineraries across ALL cabins on the availability, so
@@ -168,7 +186,21 @@ def format_award_embed(award: AwardAvailability, verdict: Verdict, trip: dict, *
     No "saver" in the title: there's no per-item saver flag on the wire --
     saver-equivalence comes entirely from the Cached Search request-time
     filter (see seats_aero.py's cached_search docstring), so claiming it
-    per-item here would be asserting something we can't verify."""
+    per-item here would be asserting something we can't verify.
+
+    `transfer_bonus_pct` (0.0 = no active bonus, the common case) adds a
+    "Transfer Bonus" field showing the informational effective-points cost --
+    see src/valuation.py's compute_transfer_bonus_effective_miles. Computed
+    off `miles` below (the Get-Trips-confirmed figure), not award.miles, to
+    stay consistent with the rest of this alert using the more authoritative
+    post-confirm number.
+
+    `group_other_dates` (empty/None by default) lists every OTHER date in
+    this award's (origin, destination, cabin, program, calendar month)
+    group that also cleared the first-pass gate but lost to this one -- see
+    src/valuation.py's select_group_winners. Adds an "Other Dates" field
+    naming the month and those specific dates when non-empty; shows nothing
+    when empty, same as transfer_bonus_pct's 0.0 case."""
     cabin_label = award.cabin.title()
     program_label = award.program.replace("_", " ").title()
     miles = int(trip["MileageCost"])
@@ -183,6 +215,21 @@ def format_award_embed(award: AwardAvailability, verdict: Verdict, trip: dict, *
         {"name": "Seats", "value": str(seats) if seats is not None else None, "inline": True},
         {"name": "Nonstop", "value": "Yes" if award.direct else "No", "inline": True},
     ]
+    if transfer_bonus_pct:
+        effective_miles = compute_transfer_bonus_effective_miles(miles, transfer_bonus_pct)
+        fields.append({
+            "name": "Transfer Bonus",
+            "value": f"{transfer_bonus_pct * 100:.0f}% transfer bonus active -- effective cost ~{effective_miles:,.0f} pts",
+            "inline": False,
+        })
+    if group_other_dates:
+        month_name = award.date.strftime("%B")
+        dates_str = ", ".join(d.isoformat() for d in group_other_dates)
+        fields.append({
+            "name": "Other Dates",
+            "value": f"+{len(group_other_dates)} other date(s) in {month_name} also qualify ({dates_str})",
+            "inline": False,
+        })
     fields = [f for f in fields if f["value"]]  # Discord 400s on empty field values
 
     embed: dict = {
@@ -249,11 +296,18 @@ def format_cash_embed(fare: CashFare, verdict: Verdict, baseline: Baseline | Non
 def _format_digest_entry_field(entry: DigestEntry) -> dict:
     program_label = entry.award.program.replace("_", " ").title()
     match_note = " -- would clear real-time bar" if entry.cleared_real_time_bar else ""
+    bonus_note = ""
+    if entry.transfer_bonus_pct:
+        effective_miles = compute_transfer_bonus_effective_miles(entry.award.miles, entry.transfer_bonus_pct)
+        bonus_note = (
+            f"\n{entry.transfer_bonus_pct * 100:.0f}% transfer bonus active -- "
+            f"effective cost ~{effective_miles:,.0f} pts"
+        )
     name = f"{entry.award.origin} -> {entry.award.destination} ({entry.award.date.isoformat()})"
     value = (
         f"{program_label} - {entry.award.miles:,} mi + ${entry.taxes_usd:,.0f} taxes\n"
         f"${entry.comparable_cash_usd:,.0f} cash | {entry.cpp:.1f}¢/pt | ${entry.trip_value_usd:,.0f} trip value"
-        f"{match_note}"
+        f"{match_note}{bonus_note}"
     )
     return {"name": name, "value": value, "inline": False}
 

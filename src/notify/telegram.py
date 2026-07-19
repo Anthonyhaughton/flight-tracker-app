@@ -6,6 +6,7 @@ sends (see .claude/skills/telegram-alerting).
 
 from __future__ import annotations
 
+import datetime
 import re
 
 import httpx
@@ -15,7 +16,7 @@ from src.notify.base import Button
 from src.providers.cash.base import CashFare
 from src.providers.seats_aero import AwardAvailability, parse_trip_taxes_usd
 from src.state import Baseline
-from src.valuation import Verdict
+from src.valuation import Verdict, compute_transfer_bonus_effective_miles
 
 _MDV2_SPECIAL = r"_*[]()~`>#+-=|{}.!"
 
@@ -48,9 +49,21 @@ class TelegramNotifier:
             raise TelegramError(f"Telegram send failed ({response.status_code}): {response.text}")
 
     def send_award_alert(
-        self, award: AwardAvailability, verdict: Verdict, trip: dict, *, deep_link: str | None = None
+        self,
+        award: AwardAvailability,
+        verdict: Verdict,
+        trip: dict,
+        *,
+        deep_link: str | None = None,
+        transfer_bonus_pct: float = 0.0,
+        group_other_dates: list[datetime.date] | None = None,
     ) -> None:
-        self.send(format_award_alert(award, verdict, trip, deep_link=deep_link))
+        self.send(
+            format_award_alert(
+                award, verdict, trip, deep_link=deep_link, transfer_bonus_pct=transfer_bonus_pct,
+                group_other_dates=group_other_dates,
+            )
+        )
 
     def send_cash_alert(self, fare: CashFare, verdict: Verdict, baseline: Baseline | None) -> None:
         self.send(format_cash_alert(fare, verdict, baseline))
@@ -71,7 +84,15 @@ def _button_to_dict(button: Button) -> dict:
     return d
 
 
-def format_award_alert(award: AwardAvailability, verdict: Verdict, trip: dict, *, deep_link: str | None = None) -> str:
+def format_award_alert(
+    award: AwardAvailability,
+    verdict: Verdict,
+    trip: dict,
+    *,
+    deep_link: str | None = None,
+    transfer_bonus_pct: float = 0.0,
+    group_other_dates: list[datetime.date] | None = None,
+) -> str:
     """`trip` is one entry from SeatsAeroClient.get_trips(award.availability_id),
     already filtered to award.cabin by select_trip_for_cabin() in poller.py
     (Get Trips returns itineraries across ALL cabins on the availability, so
@@ -81,7 +102,19 @@ def format_award_alert(award: AwardAvailability, verdict: Verdict, trip: dict, *
     No "saver" in the message: there's no per-item saver flag on the wire --
     saver-equivalence comes entirely from the Cached Search request-time
     filter, so claiming it per-item here would assert something we can't
-    verify."""
+    verify.
+
+    `transfer_bonus_pct` (0.0 = no active bonus, the common case) adds a
+    line showing the informational effective-points cost -- see
+    src/valuation.py's compute_transfer_bonus_effective_miles. Computed off
+    `miles` below (the Get-Trips-confirmed figure), not award.miles, same
+    reasoning as format_award_embed's Discord equivalent.
+
+    `group_other_dates` (empty/None by default) lists every OTHER date in
+    this award's (origin, destination, cabin, program, calendar month)
+    group that also cleared the first-pass gate but lost to this one -- see
+    src/valuation.py's select_group_winners. Adds a line naming the month
+    and those specific dates when non-empty; shows nothing when empty."""
     esc = escape_markdown_v2
     stops = "nonstop" if award.direct else "connecting"
     program_label = award.program.replace("_", " ").title()
@@ -95,6 +128,19 @@ def format_award_alert(award: AwardAvailability, verdict: Verdict, trip: dict, *
         f"\U0001F4B3 {esc(f'{miles:,}')} {esc(program_label)} \\+ \\${esc(f'{taxes_usd:,.0f}')}"
         f"  →  {esc(verdict.headline)}",
     ]
+    if transfer_bonus_pct:
+        effective_miles = compute_transfer_bonus_effective_miles(miles, transfer_bonus_pct)
+        lines.append(
+            f"\U0001F4B1 {esc(f'{transfer_bonus_pct * 100:.0f}%')} transfer bonus active — effective cost "
+            f"~{esc(f'{effective_miles:,.0f}')} pts"
+        )
+    if group_other_dates:
+        month_name = award.date.strftime("%B")
+        dates_str = ", ".join(d.isoformat() for d in group_other_dates)
+        lines.append(
+            f"\U0001F4C6 {esc(f'+{len(group_other_dates)}')} other date(s) in {esc(month_name)} also qualify "
+            f"\\({esc(dates_str)}\\)"
+        )
     if deep_link:
         lines.append(f"\U0001F517 [Book on {esc(program_label)}]({deep_link})")
     return "\n".join(lines)
@@ -135,11 +181,18 @@ def _format_digest_entry_line(entry: DigestEntry) -> str:
     esc = escape_markdown_v2
     program_label = entry.award.program.replace("_", " ").title()
     match_note = " ⭐" if entry.cleared_real_time_bar else ""
+    bonus_note = ""
+    if entry.transfer_bonus_pct:
+        effective_miles = compute_transfer_bonus_effective_miles(entry.award.miles, entry.transfer_bonus_pct)
+        bonus_note = (
+            f" \\| {esc(f'{entry.transfer_bonus_pct * 100:.0f}%')} transfer bonus active, "
+            f"~{esc(f'{effective_miles:,.0f}')} pts effective"
+        )
     return (
         f"• {esc(entry.award.origin)} → {esc(entry.award.destination)} "
         f"{esc(entry.award.date.isoformat())}: {esc(program_label)} {esc(f'{entry.award.miles:,}')} mi "
         f"\\+ \\${esc(f'{entry.taxes_usd:,.0f}')} → \\${esc(f'{entry.comparable_cash_usd:,.0f}')} cash, "
-        f"{esc(f'{entry.cpp:.1f}')}cpp, \\${esc(f'{entry.trip_value_usd:,.0f}')} value{match_note}"
+        f"{esc(f'{entry.cpp:.1f}')}cpp, \\${esc(f'{entry.trip_value_usd:,.0f}')} value{match_note}{bonus_note}"
     )
 
 

@@ -8,7 +8,7 @@ watchlist.yaml edit, never a code change.
 from __future__ import annotations
 
 import datetime
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import yaml
@@ -47,9 +47,28 @@ class RouteConfig:
 class AwardConfig:
     min_trip_value_usd: float
     cpp_floors: dict[str, float]
+    # Free (no cash lookup) sanity check on a business/first candidate: reject
+    # if its miles cost exceeds this multiplier times economy's miles cost on
+    # the SAME seats.aero record (AwardAvailability.economy_miles) -- see
+    # src/valuation.py's passes_award_prefilter. Only applies to business/
+    # first; economy candidates are unaffected. Defaulted so existing
+    # AwardConfig(...) call sites (mostly tests) that predate this field
+    # don't break.
+    premium_cabin_max_multiplier: float = 2.0
+    # Per-program transfer bonus, as a fraction (0.25 = 25%), e.g. a
+    # promotional Amex MR/Chase UR -> program transfer bonus. Manually
+    # maintained in watchlist.yaml -- no automated fetching of any kind.
+    # Defaults to 0.0 (no bonus) for any program not listed. Purely
+    # informational: surfaced alongside the real CPP number in alerts/digest
+    # (see notify/discord.py, notify/telegram.py), never fed into any
+    # gating/threshold decision.
+    transfer_bonus_pct: dict[str, float] = field(default_factory=dict)
 
     def cpp_floor(self, program: str) -> float:
         return self.cpp_floors.get(program, self.cpp_floors.get("default", 1.4))
+
+    def bonus_pct(self, program: str) -> float:
+        return self.transfer_bonus_pct.get(program, 0.0)
 
 
 @dataclass(frozen=True)
