@@ -13,6 +13,42 @@ from src.providers.seats_aero import AwardAvailability
 from src.state import InMemoryStateStore, award_key, baseline_key, cash_key
 
 
+# --- production observability: importing src.poller (this file's own import
+# above, and any real Lambda cold start) must configure the root logger to
+# INFO -- regression coverage for a real gap where NOTHING ever did this,
+# silently swallowing every logger.info() call in production (see
+# src/poller.py's own comment on the logging.basicConfig(...) call for the
+# full incident and why force=True specifically is required). Asserting on
+# the CURRENT state of the logging module, not calling a function, since
+# src/poller.py configures this once at import time (module level, matching
+# Lambda's cold-start execution model) -- by the time any test in this file
+# runs, the import at the top of this file has already triggered it. ---
+
+
+def test_importing_poller_configures_root_logger_to_info():
+    assert logging.getLogger().level == logging.INFO
+    # "poller" itself sets no override -- its effective level resolves via
+    # propagation up to the root's INFO, so its own logger.info() calls
+    # actually emit.
+    assert logging.getLogger("poller").isEnabledFor(logging.INFO)
+
+
+def test_importing_poller_silences_httpx_specifically_not_globally():
+    """The secret-leak lesson scripts/dry_run.py already learned: httpx logs
+    full request URLs (including query-string credentials, e.g. SerpApi's
+    api_key or a webhook token) at INFO by default. Confirm httpx is scoped
+    back to WARNING specifically -- and that this is a targeted scope, not a
+    side effect of some broader "not INFO" default that would also silence
+    this project's own loggers."""
+    assert not logging.getLogger("httpx").isEnabledFor(logging.INFO)
+    assert logging.getLogger("httpx").isEnabledFor(logging.WARNING)
+    # The scoping must be specific to httpx -- confirm a sibling/unrelated
+    # logger with no explicit level of its own still resolves to INFO via
+    # root, i.e. httpx's WARNING override doesn't leak onto other loggers.
+    assert logging.getLogger("digest").isEnabledFor(logging.INFO)
+    assert logging.getLogger("some_other_never_configured_logger").isEnabledFor(logging.INFO)
+
+
 class FakeSeatsAeroClient:
     def __init__(self, hits: list[AwardAvailability]):
         self._hits = hits

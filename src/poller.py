@@ -144,6 +144,58 @@ from src.valuation import (
 
 logger = logging.getLogger("poller")
 
+# Real production observability gap, fixed here: NOTHING in this module (or
+# src/digest.py, or lambda_handler below) ever configured Python's logging
+# level, so every logger.info() call -- Cached Search hit counts, programs
+# seen, cash-baseline refresh/cache lines, SENT/SKIP lines, the "poll
+# complete" summary -- was silently swallowed by the default root logger
+# level (WARNING). Confirmed via a real manual invoke (2026-07-19):
+# CloudWatch only ever showed the Lambda platform's own INIT_START/START/
+# END/REPORT lines, never a single line from this project's own code, since
+# the first deploy. scripts/dry_run.py never had this problem because it
+# separately calls logging.basicConfig(level=logging.INFO, ...) itself --
+# that config never applied here.
+#
+# Mirrors dry_run.py's exact format ("%(levelname)s %(message)s"), but with
+# one addition that matters specifically in Lambda: `force=True`. Without
+# it, this call is a silent no-op -- confirmed by direct experiment: AWS
+# Lambda's Python runtime pre-attaches its own handler to the root logger
+# before this module ever imports, and logging.basicConfig() explicitly
+# does nothing if the root logger already has a handler, UNLESS force=True
+# is passed (see the stdlib docs for basicConfig). A bare copy of
+# dry_run.py's call -- correct there, because a plain script's root logger
+# starts with no handler at all -- would have looked like a fix here while
+# changing nothing. force=True clears whatever handler Lambda pre-attached
+# and installs this one instead; empirically confirmed (via pytest's own
+# caplog fixture, which imports and exercises this module across the whole
+# test suite) that this does not disrupt anything else attached to the root
+# logger.
+#
+# Module level, not inside lambda_handler(): module-level code runs exactly
+# once per cold start (matching Lambda's own execution model -- a warm
+# invocation reuses the same container/import, never re-running this),
+# same "once per container" scope scripts/dry_run.py gets from running this
+# at module scope in a fresh process each time.
+logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s", force=True)
+
+# Same secret-leak lesson scripts/dry_run.py already learned (see its own
+# comment): httpx logs "HTTP Request: <method> <full URL> ..." at INFO by
+# default, and this project's real HTTP calls put a credential in the URL
+# itself for three of the four HTTP clients in play here -- the Discord
+# webhook URL (src/notify/discord.py), the Telegram bot token
+# (src/notify/telegram.py), and the SerpApi api_key query param
+# (src/providers/cash/serpapi.py). Only seats.aero's key travels as a
+# header, not the URL, so it isn't at risk -- but the other three are, and
+# the fix above would otherwise newly expose exactly this in production for
+# the first time (dry_run.py already silences this for its own runs; this
+# is that same fix applied to the real Lambda). Scoped to httpx
+# specifically, not the whole library ecosystem or any of this project's
+# own loggers -- boto3/botocore's own INFO-level output (credential-
+# provider resolution messages, no secret values) was checked directly and
+# found to carry nothing sensitive at INFO, so it's left alone rather than
+# silenced without a real reason to.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
 # Matches infra/monitoring.tf's local.heartbeat_namespace ("${var.project_name}/Heartbeat")
 # and infra/iam.tf's Heartbeat statement condition -- keep all three in sync if the
 # project name or Terraform defaults change. (This constant was a stale pre-rename
